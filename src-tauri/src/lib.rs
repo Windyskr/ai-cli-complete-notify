@@ -187,6 +187,15 @@ fn read_silent_start_setting() -> bool {
         .unwrap_or(false)
 }
 
+fn read_lightweight_start_setting() -> bool {
+    read_settings_json()
+        .as_ref()
+        .and_then(|parsed| parsed.get("ui"))
+        .and_then(|ui| ui.get("lightweightStart"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
 fn read_ui_language() -> UiLanguage {
     read_settings_json()
         .as_ref()
@@ -435,8 +444,12 @@ pub fn run() {
             let launch_state = LaunchState {
                 silent_start_requested: std::env::args().any(|arg| arg == "--silent-start"),
             };
-            let should_stay_hidden =
-                launch_state.silent_start_requested || read_silent_start_setting();
+            // Boot straight into tray-only lightweight mode when configured.
+            // This takes precedence over silentStart (hide window only).
+            let lightweight_start = read_lightweight_start_setting();
+            let should_stay_hidden = launch_state.silent_start_requested
+                || read_silent_start_setting()
+                || lightweight_start;
 
             app.manage(launch_state);
             app.manage(Mutex::new(RuntimeState::default()));
@@ -452,7 +465,7 @@ pub fn run() {
             let tray = tauri::tray::TrayIconBuilder::with_id("main")
                 .icon(TRAY_ICON.clone())
                 .menu(&tray_menu)
-                .tooltip(language.tray_tooltip(false))
+                .tooltip(language.tray_tooltip(lightweight_start))
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show" => {
@@ -481,7 +494,10 @@ pub fn run() {
 
             let _ = tray.set_visible(true);
 
-            if !should_stay_hidden {
+            if lightweight_start {
+                // Destroy the webview and keep a Rust-owned watch without loading UI.
+                let _ = enter_lightweight_mode_impl(app.handle());
+            } else if !should_stay_hidden {
                 restore_main_window(app.handle());
             }
 

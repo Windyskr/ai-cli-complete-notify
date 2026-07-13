@@ -17,6 +17,7 @@ export interface AppConfig {
     closeBehavior: 'ask' | 'tray' | 'exit';
     autostart: boolean;
     silentStart: boolean;
+    lightweightStart: boolean;
     watchLogRetentionDays: number;
     autoFocusOnNotify: boolean;
     forceMaximizeOnFocus: boolean;

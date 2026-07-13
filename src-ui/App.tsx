@@ -155,6 +155,17 @@ export default function App() {
         }
       }
 
+      // lightweightStart is handled natively at boot (destroys webview).
+      // Keep a frontend safety path if the window still exists.
+      if (cfg?.ui?.lightweightStart) {
+        try {
+          await enterLightweightMode();
+        } catch (e) {
+          console.error('boot lightweight mode failed:', e);
+        }
+        return;
+      }
+
       const shouldStayHidden = Boolean(runtimeStartupStatus?.silentStartRequested) || Boolean(cfg?.ui?.silentStart);
       if (!shouldStayHidden || !cfg) {
         await revealMainWindow();

@@ -9,6 +9,7 @@
   },
   "ui": {
     "silentStart": false,
+    "lightweightStart": false,
     "confirmAlert": {
       "enabled": false
     }

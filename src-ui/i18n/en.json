@@ -129,6 +129,8 @@
   "advanced.autostartHint": "Supported on Windows/macOS; Linux requires manual setup.",
   "advanced.silentStart": "Silent start (hide to tray on launch)",
   "advanced.silentStartHint": "Takes effect next launch and skips the tray balloon.",
+  "advanced.lightweightStart": "Start in lightweight mode",
+  "advanced.lightweightStartHint": "On next launch, destroy the main UI and keep only the tray + background watch. Uses less memory than silent start; click the tray to reopen the UI.",
   "close.message": "Close the app?",
   "close.detail": "Minimize to the tray/menu bar to keep running, or quit to stop watchers.",
   "close.hide": "Minimize to tray",

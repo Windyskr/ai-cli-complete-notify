@@ -43,3 +43,21 @@ test('tray lightweight mode destroys webview and keeps native watch', () => {
   assert.match(windowSource, /stop_native_watch_command/);
   assert.match(watchSource, /stopNativeWatch\(\)/);
 });
+
+test('lightweightStart boots into tray-only mode without loading UI', () => {
+  const rustSource = fs.readFileSync(path.join(root, 'src-tauri', 'src', 'lib.rs'), 'utf8');
+  const defaultConfig = fs.readFileSync(path.join(root, 'src', 'default-config.js'), 'utf8');
+  const advanced = fs.readFileSync(path.join(root, 'src-ui', 'components', 'AdvancedPanel.tsx'), 'utf8');
+  const types = fs.readFileSync(path.join(root, 'src-ui', 'lib', 'types.ts'), 'utf8');
+  const zh = fs.readFileSync(path.join(root, 'src-ui', 'i18n', 'zh-CN.json'), 'utf8');
+  const en = fs.readFileSync(path.join(root, 'src-ui', 'i18n', 'en.json'), 'utf8');
+
+  assert.match(defaultConfig, /lightweightStart:\s*false/);
+  assert.match(types, /lightweightStart:\s*boolean/);
+  assert.match(advanced, /lightweightStart/);
+  assert.match(zh, /"advanced\.lightweightStart"/);
+  assert.match(en, /"advanced\.lightweightStart"/);
+  assert.match(rustSource, /fn read_lightweight_start_setting/);
+  assert.match(rustSource, /lightweight_start/);
+  assert.match(rustSource, /if lightweight_start \{[\s\S]*enter_lightweight_mode_impl/);
+});

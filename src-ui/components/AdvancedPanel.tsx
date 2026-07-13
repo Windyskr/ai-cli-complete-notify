@@ -107,6 +107,24 @@ export default function AdvancedPanel({
             </label>
             <div className="pl-[30px] text-xs text-muted leading-relaxed">{t('advanced.silentStartHint')}</div>
           </div>
+
+          <div className="space-y-2">
+            <label className="flex items-start gap-3 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={Boolean(config.ui.lightweightStart)}
+                onChange={() =>
+                  onUpdate((c) => ({
+                    ...c,
+                    ui: { ...c.ui, lightweightStart: !c.ui.lightweightStart },
+                  }))
+                }
+                className={checkboxClass}
+              />
+              <span className="text-sm leading-relaxed">{t('advanced.lightweightStart')}</span>
+            </label>
+            <div className="pl-[30px] text-xs text-muted leading-relaxed">{t('advanced.lightweightStartHint')}</div>
+          </div>
         </div>
 
         {/* Auto focus on notify */}

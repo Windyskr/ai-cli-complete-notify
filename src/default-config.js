@@ -22,6 +22,8 @@ const DEFAULT_CONFIG = {
     closeBehavior: 'ask', // ask | tray | exit
     autostart: false,
     silentStart: false,
+    // Boot directly into tray-only lightweight mode (destroy webview; keep native watch).
+    lightweightStart: false,
     watchLogRetentionDays: 7,
     autoFocusOnNotify: false,
     forceMaximizeOnFocus: false,

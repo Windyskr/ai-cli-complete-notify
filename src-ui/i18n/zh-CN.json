@@ -129,6 +129,8 @@
   "advanced.autostartHint": "Windows / macOS 支持开机自启动；Linux 需自行配置。",
   "advanced.silentStart": "无感启动（启动后自动隐藏到托盘）",
   "advanced.silentStartHint": "开启后下次启动会直接隐藏到托盘且不弹出提示。",
+  "advanced.lightweightStart": "开机直接进入轻量模式",
+  "advanced.lightweightStartHint": "下次启动后销毁主界面，仅保留托盘与后台监听。比无感启动更省内存；点击托盘可重新打开界面。",
   "close.message": "关闭应用？",
   "close.detail": "可选择隐藏到托盘/菜单栏继续运行，或直接退出并停止监听。",
   "close.hide": "隐藏到托盘",
