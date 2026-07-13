@@ -17,38 +17,56 @@ test('close dialog hide action delegates to the native hide_to_tray command', ()
 
 test('macOS tray hide keeps the app reopenable from dock and menu bar', () => {
   const rustSource = fs.readFileSync(path.join(root, 'src-tauri', 'src', 'lib.rs'), 'utf8');
+  const lightweightSource = fs.readFileSync(
+    path.join(root, 'src-tauri', 'src', 'lightweight.rs'),
+    'utf8',
+  );
 
   assert.doesNotMatch(rustSource, /app\.hide\(\)/);
   assert.doesNotMatch(rustSource, /button_state:\s*tauri::tray::MouseButtonState::Up/);
   assert.match(rustSource, /RunEvent::Reopen/);
-  assert.match(rustSource, /exit_lightweight_mode_impl\(app\)|restore_main_window\(app\)/);
+  assert.match(lightweightSource, /exit_lightweight_mode/);
 });
 
-test('tray lightweight mode destroys webview and keeps native watch', () => {
+test('tray lightweight mode follows cc-switch destroy + prevent_exit pattern', () => {
   const appSource = fs.readFileSync(path.join(root, 'src-ui', 'App.tsx'), 'utf8');
   const windowSource = fs.readFileSync(path.join(root, 'src-ui', 'lib', 'window.ts'), 'utf8');
   const watchSource = fs.readFileSync(path.join(root, 'src-ui', 'hooks', 'useWatch.ts'), 'utf8');
   const rustSource = fs.readFileSync(path.join(root, 'src-tauri', 'src', 'lib.rs'), 'utf8');
+  const lightweightSource = fs.readFileSync(
+    path.join(root, 'src-tauri', 'src', 'lightweight.rs'),
+    'utf8',
+  );
 
-  assert.match(rustSource, /"lightweight"/);
-  assert.match(rustSource, /fn enter_lightweight_mode_impl/);
-  assert.match(rustSource, /destroy_main_window/);
-  assert.match(rustSource, /start_native_watch/);
-  assert.match(rustSource, /enter-lightweight-requested/);
-  assert.match(rustSource, /WebviewWindowBuilder::new/);
-  assert.match(rustSource, /allow_window_destroy/);
-  assert.match(rustSource, /if allow_destroy \{\s*return;/);
-  assert.match(rustSource, /fn request_enter_lightweight_mode/);
-  assert.match(rustSource, /enter_lightweight_mode_impl\(app\)/);
-  // Destroying the last webview must not exit the process / kill the tray.
+  // Dedicated module (cc-switch style).
+  assert.match(rustSource, /mod lightweight;/);
+  assert.match(lightweightSource, /fn enter_lightweight_mode/);
+  assert.match(lightweightSource, /fn exit_lightweight_mode/);
+  assert.match(lightweightSource, /fn is_lightweight_mode/);
+  assert.match(lightweightSource, /\.destroy\(\)/);
+  assert.match(lightweightSource, /WebviewWindowBuilder::from_config/);
+  assert.match(lightweightSource, /AtomicBool/);
+
+  // Tray uses CheckMenuItem toggle, not a one-shot text item only.
+  assert.match(rustSource, /CheckMenuItem::with_id/);
+  assert.match(rustSource, /"lightweight_mode"/);
+  assert.match(rustSource, /toggle_lightweight_mode|enter_lightweight_mode/);
+
+  // ExitRequested: code=None stays in tray.
   assert.match(rustSource, /ExitRequested/);
   assert.match(rustSource, /prevent_exit\(\)/);
+  assert.match(rustSource, /classify_exit_request|StayInTray/);
+
+  // Close-to-tray remains hide (not destroy).
+  assert.match(rustSource, /hide_main_window_to_tray/);
+
   // Helper processes must not open a visible Windows Terminal / console popup.
   assert.match(rustSource, /CREATE_NO_WINDOW/);
   assert.match(rustSource, /hide_console/);
 
+  // Watch handover kept for this app's architecture.
+  assert.match(rustSource, /start_native_watch/);
   assert.match(appSource, /enter-lightweight-requested/);
-  // Boot path may still call enterLightweightMode as a safety net.
   assert.match(windowSource, /enter_lightweight_mode/);
   assert.match(windowSource, /stop_native_watch_command/);
   assert.match(watchSource, /stopNativeWatch\(\)/);
@@ -69,5 +87,5 @@ test('lightweightStart boots into tray-only mode without loading UI', () => {
   assert.match(en, /"advanced\.lightweightStart"/);
   assert.match(rustSource, /fn read_lightweight_start_setting/);
   assert.match(rustSource, /lightweight_start/);
-  assert.match(rustSource, /if lightweight_start \{[\s\S]*enter_lightweight_mode_impl/);
+  assert.match(rustSource, /if lightweight_start \{[\s\S]*enter_lightweight_mode/);
 });

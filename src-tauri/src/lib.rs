@@ -1,3 +1,5 @@
+mod lightweight;
+
 use serde::Serialize;
 use std::{
     env, fs,
@@ -7,7 +9,7 @@ use std::{
 };
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
-use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{Emitter, Manager};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
@@ -29,6 +31,7 @@ fn hide_console(cmd: &mut StdCommand) -> &mut StdCommand {
 }
 
 const TRAY_ICON: tauri::image::Image<'_> = tauri::include_image!("./icons/icon.png");
+pub(crate) const TRAY_ID: &str = "main";
 
 #[derive(Clone, Copy)]
 struct LaunchState {
@@ -36,23 +39,19 @@ struct LaunchState {
 }
 
 struct RuntimeState {
-    lightweight: bool,
-    /// When true, CloseRequested must not call prevent_close — otherwise
-    /// webview destroy()/close() is cancelled and lightweight mode appears broken.
-    allow_window_destroy: bool,
     /// When true, ExitRequested is allowed to finish (tray Quit / explicit exit).
-    /// Otherwise destroying the last webview would exit the whole app and kill the tray.
     allow_app_exit: bool,
     native_watch: Option<CommandChild>,
+    /// Fallback watch started via std::process (portable layout).
+    fallback_watch_running: bool,
 }
 
 impl Default for RuntimeState {
     fn default() -> Self {
         Self {
-            lightweight: false,
-            allow_window_destroy: false,
             allow_app_exit: false,
             native_watch: None,
+            fallback_watch_running: false,
         }
     }
 }
@@ -132,11 +131,31 @@ impl UiLanguage {
     }
 }
 
+/// Classify ExitRequested the same way cc-switch does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitRequestAction {
+    /// code is None: runtime auto-exit after last window destroyed → stay in tray.
+    StayInTray,
+    /// other Some(code): user/app.exit → cleanup and exit.
+    CleanupAndExit,
+}
+
+fn classify_exit_request(code: Option<i32>) -> ExitRequestAction {
+    match code {
+        None => ExitRequestAction::StayInTray,
+        Some(_) => ExitRequestAction::CleanupAndExit,
+    }
+}
+
 fn restore_main_window(app: &tauri::AppHandle) {
     #[cfg(target_os = "macos")]
     let _ = app.show();
 
     if let Some(win) = app.get_webview_window("main") {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = win.set_skip_taskbar(false);
+        }
         let _ = win.show();
         let _ = win.unminimize();
         let _ = win.set_focus();
@@ -144,11 +163,15 @@ fn restore_main_window(app: &tauri::AppHandle) {
 }
 
 fn hide_main_window_to_tray(app: &tauri::AppHandle) -> Result<(), String> {
-    if let Some(tray) = app.tray_by_id("main") {
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
         tray.set_visible(true).map_err(|error| error.to_string())?;
     }
 
     if let Some(win) = app.get_webview_window("main") {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = win.set_skip_taskbar(true);
+        }
         win.hide().map_err(|error| error.to_string())?;
     }
 
@@ -235,17 +258,17 @@ fn read_ui_language() -> UiLanguage {
 
 fn build_startup_status(app: &tauri::AppHandle, launch_state: LaunchState) -> StartupStatus {
     let runtime = app.state::<Mutex<RuntimeState>>();
-    let (lightweight_mode, native_watch_running) = runtime
+    let native_watch_running = runtime
         .lock()
-        .map(|state| (state.lightweight, state.native_watch.is_some()))
-        .unwrap_or((false, false));
+        .map(|state| state.native_watch.is_some() || state.fallback_watch_running)
+        .unwrap_or(false);
 
     match app.autolaunch().is_enabled() {
         Ok(enabled) => StartupStatus {
             autostart_enabled: enabled,
             autostart_supported: true,
             silent_start_requested: launch_state.silent_start_requested,
-            lightweight_mode,
+            lightweight_mode: lightweight::is_lightweight_mode(),
             native_watch_running,
             autostart_error: None,
         },
@@ -253,30 +276,55 @@ fn build_startup_status(app: &tauri::AppHandle, launch_state: LaunchState) -> St
             autostart_enabled: false,
             autostart_supported: false,
             silent_start_requested: launch_state.silent_start_requested,
-            lightweight_mode,
+            lightweight_mode: lightweight::is_lightweight_mode(),
             native_watch_running,
             autostart_error: Some(error.to_string()),
         },
     }
 }
 
-fn refresh_tray_menu(app: &tauri::AppHandle) -> Result<(), String> {
+pub(crate) fn refresh_tray_menu(app: &tauri::AppHandle) -> Result<(), String> {
     let language = read_ui_language();
-    let lightweight = app
-        .state::<Mutex<RuntimeState>>()
-        .lock()
-        .map(|state| state.lightweight)
-        .unwrap_or(false);
+    let lightweight = lightweight::is_lightweight_mode();
+
+    let show_item = tauri::menu::MenuItem::with_id(
+        app,
+        "show_main",
+        language.tray_show(),
+        true,
+        None::<&str>,
+    )
+    .map_err(|error| error.to_string())?;
+
+    // CheckMenuItem toggle — same UX as cc-switch.
+    let lightweight_item = tauri::menu::CheckMenuItem::with_id(
+        app,
+        "lightweight_mode",
+        language.tray_lightweight(),
+        true,
+        lightweight,
+        None::<&str>,
+    )
+    .map_err(|error| error.to_string())?;
+
+    let quit_item = tauri::menu::MenuItem::with_id(
+        app,
+        "quit",
+        language.tray_quit(),
+        true,
+        None::<&str>,
+    )
+    .map_err(|error| error.to_string())?;
 
     let tray_menu = tauri::menu::MenuBuilder::new(app)
-        .text("show", language.tray_show())
-        .text("lightweight", language.tray_lightweight())
+        .item(&show_item)
+        .item(&lightweight_item)
         .separator()
-        .text("quit", language.tray_quit())
+        .item(&quit_item)
         .build()
         .map_err(|error| error.to_string())?;
 
-    if let Some(tray) = app.tray_by_id("main") {
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
         tray.set_menu(Some(tray_menu))
             .map_err(|error| error.to_string())?;
         tray.set_tooltip(Some(language.tray_tooltip(lightweight)))
@@ -291,14 +339,14 @@ fn stop_native_watch_locked(state: &mut RuntimeState) {
     if let Some(child) = state.native_watch.take() {
         let _ = child.kill();
     }
+    state.fallback_watch_running = false;
 }
 
 /// Best-effort: stop any ai-reminder watch left by the frontend shell plugin
-/// before/while entering lightweight mode (Windows-only tree walk is enough).
+/// before/while entering lightweight mode.
 fn kill_orphaned_ai_reminder_watchers() {
     #[cfg(target_os = "windows")]
     {
-        // Kill only watch children, not one-shot notify/hooks commands.
         // Must use CREATE_NO_WINDOW: plain cmd/wmic opens Windows Terminal on Win11
         // with a blank tab titled like the working directory path.
         let mut cmd = StdCommand::new("powershell.exe");
@@ -322,7 +370,7 @@ fn start_native_watch(app: &tauri::AppHandle) -> Result<(), String> {
     {
         let runtime = app.state::<Mutex<RuntimeState>>();
         let state = runtime.lock().map_err(|error| error.to_string())?;
-        if state.native_watch.is_some() {
+        if state.native_watch.is_some() || state.fallback_watch_running {
             return Ok(());
         }
     }
@@ -404,11 +452,13 @@ fn start_native_watch(app: &tauri::AppHandle) -> Result<(), String> {
             )
         })?;
 
-    // We only need the process kept alive; std Child is not CommandChild, so
-    // track it by detaching and remembering via a kill-by-name on exit instead.
-    // Store nothing in native_watch (CommandChild type). On stop/quit we still
-    // call kill_orphaned_ai_reminder_watchers().
+    // Track via flag; cleanup uses kill_orphaned_ai_reminder_watchers().
     std::mem::forget(child);
+    {
+        let runtime = app.state::<Mutex<RuntimeState>>();
+        let mut state = runtime.lock().map_err(|error| error.to_string())?;
+        state.fallback_watch_running = true;
+    }
     Ok(())
 }
 
@@ -421,154 +471,47 @@ fn stop_native_watch(app: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-fn set_allow_window_destroy(app: &tauri::AppHandle, allow: bool) {
-    if let Ok(mut state) = app.state::<Mutex<RuntimeState>>().lock() {
-        state.allow_window_destroy = allow;
-    }
-}
-
 fn set_allow_app_exit(app: &tauri::AppHandle, allow: bool) {
     if let Ok(mut state) = app.state::<Mutex<RuntimeState>>().lock() {
         state.allow_app_exit = allow;
     }
 }
 
+/// Hide tray icon before hard exit so Windows does not leave a ghost icon.
+fn remove_tray_icon_before_exit(app: &tauri::AppHandle) {
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        let _ = tray.set_visible(false);
+    }
+}
+
 fn request_app_exit(app: &tauri::AppHandle) {
     set_allow_app_exit(app, true);
     let _ = stop_native_watch(app);
+    remove_tray_icon_before_exit(app);
     app.exit(0);
 }
 
-fn destroy_main_window(app: &tauri::AppHandle) -> Result<(), String> {
-    // Allow CloseRequested to proceed; otherwise destroy/close is cancelled.
-    set_allow_window_destroy(app, true);
-
-    if let Some(win) = app.get_webview_window("main") {
-        // Prefer destroy; if the platform maps it through CloseRequested, the
-        // flag above prevents prevent_close(). Fall back to close().
-        if let Err(destroy_error) = win.destroy() {
-            if let Err(close_error) = win.close() {
-                set_allow_window_destroy(app, false);
-                return Err(format!(
-                    "destroy failed: {destroy_error}; close failed: {close_error}"
-                ));
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn ensure_main_window(app: &tauri::AppHandle) -> Result<(), String> {
-    if app.get_webview_window("main").is_some() {
-        restore_main_window(app);
-        return Ok(());
-    }
-
-    WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-        .title("AI CLI Complete Notify")
-        .inner_size(1280.0, 860.0)
-        .min_inner_size(1040.0, 720.0)
-        .center()
-        .visible(true)
-        .build()
-        .map_err(|error| error.to_string())?;
-
-    restore_main_window(app);
-    Ok(())
-}
-
-fn enter_lightweight_mode_impl(app: &tauri::AppHandle) -> Result<(), String> {
-    // Already tray-only: just ensure watch + tray menu.
-    let already = app
-        .state::<Mutex<RuntimeState>>()
-        .lock()
-        .map(|state| state.lightweight && app.get_webview_window("main").is_none())
-        .unwrap_or(false);
-    if already {
-        let _ = start_native_watch(app);
-        let _ = refresh_tray_menu(app);
-        return Ok(());
-    }
-
-    if let Some(tray) = app.tray_by_id("main") {
-        tray.set_visible(true).map_err(|error| error.to_string())?;
-    }
-
-    // Mark lightweight before destroying the last window. Tauri exits by default
-    // when the last webview is gone; ExitRequested uses this flag + allow_app_exit
-    // to keep the process/tray alive.
-    {
-        let runtime = app.state::<Mutex<RuntimeState>>();
-        let mut state = runtime.lock().map_err(|error| error.to_string())?;
-        state.lightweight = true;
-        state.allow_app_exit = false;
-    }
-
-    // Frontend may still own an ai-reminder watch via shell plugin. Kill it
-    // before starting the Rust-owned one so we don't run two watchers, and so
-    // lightweight mode does not depend on the webview JS path.
+/// Prepare watch ownership for lightweight mode (kill UI watch, start native).
+fn prepare_lightweight_watch(app: &tauri::AppHandle) -> Result<(), String> {
     kill_orphaned_ai_reminder_watchers();
+    start_native_watch(app)
+}
 
-    // Keep completion monitoring alive after the webview is destroyed.
-    // If watch start fails, still destroy the UI — tray stays for recovery.
-    let watch_error = start_native_watch(app).err();
-    destroy_main_window(app)?;
-
-    {
-        let runtime = app.state::<Mutex<RuntimeState>>();
-        let mut state = runtime.lock().map_err(|error| error.to_string())?;
-        state.lightweight = true;
-        state.allow_window_destroy = false;
-        state.allow_app_exit = false;
-    }
-
-    // Ensure tray stays visible after the last window is gone.
-    if let Some(tray) = app.tray_by_id("main") {
-        let _ = tray.set_visible(true);
-    }
-    refresh_tray_menu(app)?;
-
-    if let Some(error) = watch_error {
-        // Surface via tooltip so the user can tell watch failed.
-        if let Some(tray) = app.tray_by_id("main") {
-            let _ = tray.set_tooltip(Some(format!(
-                "AI CLI Complete Notify（轻量模式，监听启动失败: {error}）"
-            )));
+fn handle_tray_menu_event(app: &tauri::AppHandle, event_id: &str) {
+    match event_id {
+        "show_main" => {
+            let _ = lightweight::exit_lightweight_mode(app);
         }
-        return Err(error);
+        "lightweight_mode" => {
+            // CheckMenuItem toggle: enter or exit based on current flag.
+            // Always notify frontend first when entering so it can stop shell watch.
+            let _ = lightweight::toggle_lightweight_mode(app, prepare_lightweight_watch);
+        }
+        "quit" => {
+            request_app_exit(app);
+        }
+        _ => {}
     }
-
-    Ok(())
-}
-
-fn exit_lightweight_mode_impl(app: &tauri::AppHandle) -> Result<(), String> {
-    // Recreate the UI first. Keep any native watch running until the frontend
-    // auto-starts and calls stop_native_watch_command, so there is no gap.
-    ensure_main_window(app)?;
-
-    {
-        let runtime = app.state::<Mutex<RuntimeState>>();
-        let mut state = runtime.lock().map_err(|error| error.to_string())?;
-        state.lightweight = false;
-        state.allow_window_destroy = false;
-        state.allow_app_exit = false;
-    }
-
-    refresh_tray_menu(app)?;
-    Ok(())
-}
-
-fn request_enter_lightweight_mode(app: &tauri::AppHandle) {
-    // Always enter from Rust. Depending only on the frontend event is fragile:
-    // if JS fails after stopping its watch, the UI stays up and monitoring dies.
-    // Optionally notify the frontend so it can stop its shell child first; we
-    // also kill orphaned watchers inside enter_lightweight_mode_impl.
-    if let Some(win) = app.get_webview_window("main") {
-        let _ = win.emit("enter-lightweight-requested", ());
-    }
-
-    let _ = enter_lightweight_mode_impl(app);
 }
 
 #[tauri::command]
@@ -597,7 +540,17 @@ fn hide_to_tray(app: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn enter_lightweight_mode(app: tauri::AppHandle) -> Result<(), String> {
-    enter_lightweight_mode_impl(&app)
+    lightweight::enter_lightweight_mode(&app, prepare_lightweight_watch)
+}
+
+#[tauri::command]
+fn exit_lightweight_mode(app: tauri::AppHandle) -> Result<(), String> {
+    lightweight::exit_lightweight_mode(&app)
+}
+
+#[tauri::command]
+fn is_lightweight_mode() -> bool {
+    lightweight::is_lightweight_mode()
 }
 
 #[tauri::command]
@@ -609,7 +562,7 @@ fn stop_native_watch_command(app: tauri::AppHandle) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            let _ = exit_lightweight_mode_impl(app);
+            let _ = lightweight::exit_lightweight_mode(app);
         }))
         .plugin(
             tauri_plugin_autostart::Builder::new()
@@ -625,6 +578,8 @@ pub fn run() {
             set_autostart_enabled,
             hide_to_tray,
             enter_lightweight_mode,
+            exit_lightweight_mode,
+            is_lightweight_mode,
             stop_native_watch_command
         ])
         .setup(|app| {
@@ -642,29 +597,42 @@ pub fn run() {
             app.manage(Mutex::new(RuntimeState::default()));
 
             let language = read_ui_language();
+            let show_item = tauri::menu::MenuItem::with_id(
+                app,
+                "show_main",
+                language.tray_show(),
+                true,
+                None::<&str>,
+            )?;
+            let lightweight_item = tauri::menu::CheckMenuItem::with_id(
+                app,
+                "lightweight_mode",
+                language.tray_lightweight(),
+                true,
+                lightweight_start,
+                None::<&str>,
+            )?;
+            let quit_item = tauri::menu::MenuItem::with_id(
+                app,
+                "quit",
+                language.tray_quit(),
+                true,
+                None::<&str>,
+            )?;
             let tray_menu = tauri::menu::MenuBuilder::new(app)
-                .text("show", language.tray_show())
-                .text("lightweight", language.tray_lightweight())
+                .item(&show_item)
+                .item(&lightweight_item)
                 .separator()
-                .text("quit", language.tray_quit())
+                .item(&quit_item)
                 .build()?;
 
-            let tray = tauri::tray::TrayIconBuilder::with_id("main")
+            let tray = tauri::tray::TrayIconBuilder::with_id(TRAY_ID)
                 .icon(TRAY_ICON.clone())
                 .menu(&tray_menu)
                 .tooltip(language.tray_tooltip(lightweight_start))
                 .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| match event.id().as_ref() {
-                    "show" => {
-                        let _ = exit_lightweight_mode_impl(app);
-                    }
-                    "lightweight" => {
-                        request_enter_lightweight_mode(app);
-                    }
-                    "quit" => {
-                        request_app_exit(app);
-                    }
-                    _ => {}
+                .on_menu_event(|app, event| {
+                    handle_tray_menu_event(app, event.id().as_ref());
                 })
                 .on_tray_icon_event(|tray, event| {
                     if let tauri::tray::TrayIconEvent::Click {
@@ -673,7 +641,7 @@ pub fn run() {
                     } = event
                     {
                         let app = tray.app_handle();
-                        let _ = exit_lightweight_mode_impl(&app);
+                        let _ = lightweight::exit_lightweight_mode(&app);
                     }
                 })
                 .build(app)?;
@@ -682,7 +650,7 @@ pub fn run() {
 
             if lightweight_start {
                 // Destroy the webview and keep a Rust-owned watch without loading UI.
-                let _ = enter_lightweight_mode_impl(app.handle());
+                let _ = lightweight::enter_lightweight_mode(app.handle(), prepare_lightweight_watch);
             } else if !should_stay_hidden {
                 restore_main_window(app.handle());
             }
@@ -691,17 +659,9 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                let allow_destroy = window
-                    .app_handle()
-                    .state::<Mutex<RuntimeState>>()
-                    .lock()
-                    .map(|state| state.allow_window_destroy || state.lightweight)
-                    .unwrap_or(false);
-
-                // Lightweight mode uses destroy()/close() to tear down the
-                // webview. Those paths also raise CloseRequested; if we always
-                // prevent_close, the tray "轻量模式" action appears to do nothing.
-                if allow_destroy {
+                // Lightweight destroy()/close() also raises CloseRequested.
+                // If we always prevent_close, tray lightweight mode appears broken.
+                if lightweight::allow_window_destroy() {
                     return;
                 }
 
@@ -709,6 +669,7 @@ pub fn run() {
 
                 match read_close_behavior() {
                     CloseBehavior::Tray => {
+                        // Close-to-tray is hide only (cc-switch style), not destroy.
                         let _ = hide_main_window_to_tray(window.app_handle());
                     }
                     CloseBehavior::Exit => {
@@ -725,20 +686,28 @@ pub fn run() {
         .run(|app, event| {
             match event {
                 // Destroying the last webview triggers ExitRequested with no
-                // exit code. Keep the process/tray alive for lightweight mode.
+                // exit code. Keep the process/tray alive (cc-switch pattern).
                 // Explicit app.exit(code) (tray Quit / frontend exit) carries a
                 // code and is allowed through.
                 tauri::RunEvent::ExitRequested { api, code, .. } => {
-                    let allow_exit = code.is_some()
-                        || app
-                            .state::<Mutex<RuntimeState>>()
-                            .lock()
-                            .map(|state| state.allow_app_exit)
-                            .unwrap_or(false);
-                    if !allow_exit {
-                        api.prevent_exit();
-                        if let Some(tray) = app.tray_by_id("main") {
-                            let _ = tray.set_visible(true);
+                    let allow_flag = app
+                        .state::<Mutex<RuntimeState>>()
+                        .lock()
+                        .map(|state| state.allow_app_exit)
+                        .unwrap_or(false);
+
+                    match classify_exit_request(code) {
+                        ExitRequestAction::StayInTray if !allow_flag => {
+                            api.prevent_exit();
+                            if let Some(tray) = app.tray_by_id(TRAY_ID) {
+                                let _ = tray.set_visible(true);
+                            }
+                        }
+                        ExitRequestAction::CleanupAndExit | ExitRequestAction::StayInTray => {
+                            // User quit path: ensure watch is stopped and tray is cleared.
+                            // app.exit already set allow_app_exit; just let it proceed.
+                            let _ = stop_native_watch(app);
+                            remove_tray_icon_before_exit(app);
                         }
                     }
                 }
@@ -748,10 +717,28 @@ pub fn run() {
                     ..
                 } => {
                     if !has_visible_windows {
-                        let _ = exit_lightweight_mode_impl(app);
+                        let _ = lightweight::exit_lightweight_mode(app);
                     }
                 }
                 _ => {}
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_exit_request, ExitRequestAction};
+
+    #[test]
+    fn no_code_keeps_app_alive_in_tray() {
+        assert_eq!(classify_exit_request(None), ExitRequestAction::StayInTray);
+    }
+
+    #[test]
+    fn some_code_is_user_exit() {
+        assert_eq!(
+            classify_exit_request(Some(0)),
+            ExitRequestAction::CleanupAndExit
+        );
+    }
 }
