@@ -43,6 +43,9 @@ test('tray lightweight mode destroys webview and keeps native watch', () => {
   // Destroying the last webview must not exit the process / kill the tray.
   assert.match(rustSource, /ExitRequested/);
   assert.match(rustSource, /prevent_exit\(\)/);
+  // Helper processes must not open a visible Windows Terminal / console popup.
+  assert.match(rustSource, /CREATE_NO_WINDOW/);
+  assert.match(rustSource, /hide_console/);
 
   assert.match(appSource, /enter-lightweight-requested/);
   // Boot path may still call enterLightweightMode as a safety net.

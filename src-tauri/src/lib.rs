@@ -5,10 +5,28 @@ use std::{
     process::Command as StdCommand,
     sync::Mutex,
 };
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
+
+/// Hide console windows when spawning helper processes on Windows.
+/// Without this, Windows 11 often opens Windows Terminal for cmd/console apps,
+/// which looks like a blank popup titled with the app working directory.
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(target_os = "windows")]
+fn hide_console(cmd: &mut StdCommand) -> &mut StdCommand {
+    cmd.creation_flags(CREATE_NO_WINDOW)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hide_console(cmd: &mut StdCommand) -> &mut StdCommand {
+    cmd
+}
 
 const TRAY_ICON: tauri::image::Image<'_> = tauri::include_image!("./icons/icon.png");
 
@@ -281,14 +299,22 @@ fn kill_orphaned_ai_reminder_watchers() {
     #[cfg(target_os = "windows")]
     {
         // Kill only watch children, not one-shot notify/hooks commands.
-        let _ = StdCommand::new("cmd.exe")
+        // Must use CREATE_NO_WINDOW: plain cmd/wmic opens Windows Terminal on Win11
+        // with a blank tab titled like the working directory path.
+        let mut cmd = StdCommand::new("powershell.exe");
+        hide_console(&mut cmd)
             .args([
-                "/C",
-                "wmic process where \"name='ai-reminder.exe' and CommandLine like '% watch %'\" call terminate",
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                "Get-CimInstance Win32_Process -Filter \"Name = 'ai-reminder.exe'\" | Where-Object { $_.CommandLine -match '(\\s|^)watch(\\s|$)' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status();
+            .status()
+            .ok();
     }
 }
 
@@ -362,9 +388,11 @@ fn start_native_watch(app: &tauri::AppHandle) -> Result<(), String> {
             )
         })?;
 
-    let child = StdCommand::new(&sidecar_path)
+    let mut cmd = StdCommand::new(&sidecar_path);
+    let child = hide_console(&mut cmd)
         .args(watch_args)
         .current_dir(dir)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
