@@ -9,6 +9,15 @@ export function enterLightweightMode() {
   return invoke<void>('enter_lightweight_mode');
 }
 
+/** Recreate/show the main window and leave tray-only mode. */
+export function exitLightweightMode() {
+  return invoke<void>('exit_lightweight_mode');
+}
+
+export function isLightweightMode() {
+  return invoke<boolean>('is_lightweight_mode');
+}
+
 /** Stop the Rust-owned watch process before the frontend takes over. */
 export function stopNativeWatch() {
   return invoke<void>('stop_native_watch_command');
