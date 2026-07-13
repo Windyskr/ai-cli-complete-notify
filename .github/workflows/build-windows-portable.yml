@@ -6,22 +6,23 @@ on:
     branches:
       - feat/lightweight-mode
     paths:
-      - '.github/workflows/build-windows-portable.yml'
-      - 'package.json'
-      - 'package-lock.json'
-      - 'src/**'
-      - 'src-ui/**'
-      - 'src-tauri/**'
-      - 'tools/**'
-      - 'vite.config.ts'
-      - 'tsconfig.json'
-      - 'tailwind.config.js'
-      - 'postcss.config.js'
-      - 'ai-reminder.js'
-      - 'index.html'
+      - ".github/workflows/build-windows-portable.yml"
+      - "package.json"
+      - "package-lock.json"
+      - "src/**"
+      - "src-ui/**"
+      - "src-tauri/**"
+      - "tools/**"
+      - "vite.config.ts"
+      - "tsconfig.json"
+      - "tailwind.config.js"
+      - "postcss.config.js"
+      - "ai-reminder.js"
+      - "index.html"
 
 permissions:
   contents: read
+  actions: write
 
 concurrency:
   group: build-windows-portable-${{ github.ref }}
@@ -35,9 +36,6 @@ jobs:
 
     env:
       CARGO_TERM_COLOR: always
-      # Prefer runner temp so tools/run-tauri-build.js does not require a D: drive.
-      AI_NOTIFY_TMP_DIR: ${{ runner.temp }}\ai-cli-complete-notify
-      npm_config_cache: ${{ runner.temp }}\npm-cache
 
     steps:
       - name: Checkout
@@ -46,7 +44,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: "22"
           cache: npm
 
       - name: Setup Rust
@@ -60,6 +58,20 @@ jobs:
           workspaces: src-tauri -> target
           shared-key: portable-win-x64
 
+      - name: Configure temp paths for CI
+        shell: pwsh
+        run: |
+          $tmp = Join-Path $env:RUNNER_TEMP "ai-cli-complete-notify"
+          $npmCache = Join-Path $env:RUNNER_TEMP "npm-cache"
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          New-Item -ItemType Directory -Force -Path $npmCache | Out-Null
+          "AI_NOTIFY_TMP_DIR=$tmp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "npm_config_cache=$npmCache" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TEMP=$tmp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TMP=$tmp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "AI_NOTIFY_TMP_DIR=$tmp"
+          Write-Host "npm_config_cache=$npmCache"
+
       - name: Install npm dependencies
         run: npm ci
 
@@ -69,6 +81,9 @@ jobs:
       - name: List dist outputs
         shell: pwsh
         run: |
+          if (-not (Test-Path dist)) {
+            throw "dist directory not found"
+          }
           Get-ChildItem dist -Recurse -File |
             Select-Object FullName, Length, LastWriteTime |
             Format-Table -AutoSize
