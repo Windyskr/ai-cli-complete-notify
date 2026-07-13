@@ -22,6 +22,9 @@ struct RuntimeState {
     /// When true, CloseRequested must not call prevent_close — otherwise
     /// webview destroy()/close() is cancelled and lightweight mode appears broken.
     allow_window_destroy: bool,
+    /// When true, ExitRequested is allowed to finish (tray Quit / explicit exit).
+    /// Otherwise destroying the last webview would exit the whole app and kill the tray.
+    allow_app_exit: bool,
     native_watch: Option<CommandChild>,
 }
 
@@ -30,6 +33,7 @@ impl Default for RuntimeState {
         Self {
             lightweight: false,
             allow_window_destroy: false,
+            allow_app_exit: false,
             native_watch: None,
         }
     }
@@ -395,6 +399,18 @@ fn set_allow_window_destroy(app: &tauri::AppHandle, allow: bool) {
     }
 }
 
+fn set_allow_app_exit(app: &tauri::AppHandle, allow: bool) {
+    if let Ok(mut state) = app.state::<Mutex<RuntimeState>>().lock() {
+        state.allow_app_exit = allow;
+    }
+}
+
+fn request_app_exit(app: &tauri::AppHandle) {
+    set_allow_app_exit(app, true);
+    let _ = stop_native_watch(app);
+    app.exit(0);
+}
+
 fn destroy_main_window(app: &tauri::AppHandle) -> Result<(), String> {
     // Allow CloseRequested to proceed; otherwise destroy/close is cancelled.
     set_allow_window_destroy(app, true);
@@ -451,6 +467,16 @@ fn enter_lightweight_mode_impl(app: &tauri::AppHandle) -> Result<(), String> {
         tray.set_visible(true).map_err(|error| error.to_string())?;
     }
 
+    // Mark lightweight before destroying the last window. Tauri exits by default
+    // when the last webview is gone; ExitRequested uses this flag + allow_app_exit
+    // to keep the process/tray alive.
+    {
+        let runtime = app.state::<Mutex<RuntimeState>>();
+        let mut state = runtime.lock().map_err(|error| error.to_string())?;
+        state.lightweight = true;
+        state.allow_app_exit = false;
+    }
+
     // Frontend may still own an ai-reminder watch via shell plugin. Kill it
     // before starting the Rust-owned one so we don't run two watchers, and so
     // lightweight mode does not depend on the webview JS path.
@@ -466,8 +492,13 @@ fn enter_lightweight_mode_impl(app: &tauri::AppHandle) -> Result<(), String> {
         let mut state = runtime.lock().map_err(|error| error.to_string())?;
         state.lightweight = true;
         state.allow_window_destroy = false;
+        state.allow_app_exit = false;
     }
 
+    // Ensure tray stays visible after the last window is gone.
+    if let Some(tray) = app.tray_by_id("main") {
+        let _ = tray.set_visible(true);
+    }
     refresh_tray_menu(app)?;
 
     if let Some(error) = watch_error {
@@ -493,6 +524,7 @@ fn exit_lightweight_mode_impl(app: &tauri::AppHandle) -> Result<(), String> {
         let mut state = runtime.lock().map_err(|error| error.to_string())?;
         state.lightweight = false;
         state.allow_window_destroy = false;
+        state.allow_app_exit = false;
     }
 
     refresh_tray_menu(app)?;
@@ -602,8 +634,7 @@ pub fn run() {
                         request_enter_lightweight_mode(app);
                     }
                     "quit" => {
-                        let _ = stop_native_watch(app);
-                        app.exit(0);
+                        request_app_exit(app);
                     }
                     _ => {}
                 })
@@ -653,8 +684,7 @@ pub fn run() {
                         let _ = hide_main_window_to_tray(window.app_handle());
                     }
                     CloseBehavior::Exit => {
-                        let _ = stop_native_watch(window.app_handle());
-                        window.app_handle().exit(0);
+                        request_app_exit(window.app_handle());
                     }
                     CloseBehavior::Ask => {
                         let _ = window.emit("app-close-requested", ());
@@ -665,18 +695,35 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
-            #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen {
-                has_visible_windows,
-                ..
-            } = event
-            {
-                if !has_visible_windows {
-                    let _ = exit_lightweight_mode_impl(app);
+            match event {
+                // Destroying the last webview triggers ExitRequested with no
+                // exit code. Keep the process/tray alive for lightweight mode.
+                // Explicit app.exit(code) (tray Quit / frontend exit) carries a
+                // code and is allowed through.
+                tauri::RunEvent::ExitRequested { api, code, .. } => {
+                    let allow_exit = code.is_some()
+                        || app
+                            .state::<Mutex<RuntimeState>>()
+                            .lock()
+                            .map(|state| state.allow_app_exit)
+                            .unwrap_or(false);
+                    if !allow_exit {
+                        api.prevent_exit();
+                        if let Some(tray) = app.tray_by_id("main") {
+                            let _ = tray.set_visible(true);
+                        }
+                    }
                 }
+                #[cfg(target_os = "macos")]
+                tauri::RunEvent::Reopen {
+                    has_visible_windows,
+                    ..
+                } => {
+                    if !has_visible_windows {
+                        let _ = exit_lightweight_mode_impl(app);
+                    }
+                }
+                _ => {}
             }
-
-            #[cfg(not(target_os = "macos"))]
-            let _ = (app, event);
         });
 }
