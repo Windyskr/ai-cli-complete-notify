@@ -197,7 +197,9 @@ export default function App() {
     };
   }, []);
 
-  // Tray "Lightweight Mode": stop UI-owned watch, then destroy the webview.
+  // Tray "Lightweight Mode": Rust owns the transition now (destroy webview +
+  // native watch). Frontend only stops its shell-owned watch to avoid a brief
+  // double watcher; do not block on enterLightweightMode here.
   useEffect(() => {
     let cancelled = false;
     const unlistenPromise = listen('enter-lightweight-requested', () => {
@@ -207,9 +209,8 @@ export default function App() {
           if (watch.running) {
             await watch.stop();
           }
-          await enterLightweightMode();
         } catch (e) {
-          console.error('enter lightweight mode failed:', e);
+          console.error('stop watch before lightweight mode failed:', e);
         }
       })();
     });

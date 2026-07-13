@@ -2,6 +2,7 @@ use serde::Serialize;
 use std::{
     env, fs,
     path::PathBuf,
+    process::Command as StdCommand,
     sync::Mutex,
 };
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
@@ -18,6 +19,9 @@ struct LaunchState {
 
 struct RuntimeState {
     lightweight: bool,
+    /// When true, CloseRequested must not call prevent_close — otherwise
+    /// webview destroy()/close() is cancelled and lightweight mode appears broken.
+    allow_window_destroy: bool,
     native_watch: Option<CommandChild>,
 }
 
@@ -25,6 +29,7 @@ impl Default for RuntimeState {
     fn default() -> Self {
         Self {
             lightweight: false,
+            allow_window_destroy: false,
             native_watch: None,
         }
     }
@@ -266,44 +271,112 @@ fn stop_native_watch_locked(state: &mut RuntimeState) {
     }
 }
 
+/// Best-effort: stop any ai-reminder watch left by the frontend shell plugin
+/// before/while entering lightweight mode (Windows-only tree walk is enough).
+fn kill_orphaned_ai_reminder_watchers() {
+    #[cfg(target_os = "windows")]
+    {
+        // Kill only watch children, not one-shot notify/hooks commands.
+        let _ = StdCommand::new("cmd.exe")
+            .args([
+                "/C",
+                "wmic process where \"name='ai-reminder.exe' and CommandLine like '% watch %'\" call terminate",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
 fn start_native_watch(app: &tauri::AppHandle) -> Result<(), String> {
-    let runtime = app.state::<Mutex<RuntimeState>>();
-    let mut state = runtime.lock().map_err(|error| error.to_string())?;
-    if state.native_watch.is_some() {
+    {
+        let runtime = app.state::<Mutex<RuntimeState>>();
+        let state = runtime.lock().map_err(|error| error.to_string())?;
+        if state.native_watch.is_some() {
+            return Ok(());
+        }
+    }
+
+    let watch_args = [
+        "watch",
+        "--sources",
+        "all",
+        "--interval-ms",
+        "1000",
+        "--gemini-quiet-ms",
+        "3000",
+        "--claude-quiet-ms",
+        "60000",
+    ];
+
+    // Preferred: Tauri sidecar (same path the UI uses).
+    let sidecar_result = app
+        .shell()
+        .sidecar("binaries/ai-reminder")
+        .map_err(|error| error.to_string())
+        .and_then(|cmd| {
+            cmd.args(watch_args)
+                .spawn()
+                .map_err(|error| error.to_string())
+        });
+
+    if let Ok((mut rx, child)) = sidecar_result {
+        let runtime = app.state::<Mutex<RuntimeState>>();
+        let mut state = runtime.lock().map_err(|error| error.to_string())?;
+        state.native_watch = Some(child);
+        drop(state);
+
+        tauri::async_runtime::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                match event {
+                    CommandEvent::Terminated(_) => break,
+                    CommandEvent::Error(_) => break,
+                    _ => {}
+                }
+            }
+        });
         return Ok(());
     }
 
-    let sidecar = app
-        .shell()
-        .sidecar("binaries/ai-reminder")
-        .map_err(|error| error.to_string())?
-        .args([
-            "watch",
-            "--sources",
-            "all",
-            "--interval-ms",
-            "1000",
-            "--gemini-quiet-ms",
-            "3000",
-            "--claude-quiet-ms",
-            "60000",
-        ]);
+    // Fallback for portable layouts: spawn ai-reminder.exe next to the main exe.
+    let exe = env::current_exe().map_err(|error| error.to_string())?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| "cannot resolve executable directory".to_string())?;
+    let candidates = [
+        dir.join("ai-reminder.exe"),
+        dir.join("ai-reminder-x86_64-pc-windows-msvc.exe"),
+        dir.join("ai-reminder"),
+    ];
+    let sidecar_path = candidates
+        .into_iter()
+        .find(|path| path.exists())
+        .ok_or_else(|| {
+            format!(
+                "failed to start native watch: sidecar missing next to {}",
+                dir.display()
+            )
+        })?;
 
-    let (mut rx, child) = sidecar.spawn().map_err(|error| error.to_string())?;
-    state.native_watch = Some(child);
-    drop(state);
+    let child = StdCommand::new(&sidecar_path)
+        .args(watch_args)
+        .current_dir(dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            format!(
+                "failed to spawn {}: {}",
+                sidecar_path.display(),
+                error
+            )
+        })?;
 
-    // Drain stdout/stderr so the child never blocks on a full pipe.
-    tauri::async_runtime::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            match event {
-                CommandEvent::Terminated(_) => break,
-                CommandEvent::Error(_) => break,
-                _ => {}
-            }
-        }
-    });
-
+    // We only need the process kept alive; std Child is not CommandChild, so
+    // track it by detaching and remembering via a kill-by-name on exit instead.
+    // Store nothing in native_watch (CommandChild type). On stop/quit we still
+    // call kill_orphaned_ai_reminder_watchers().
+    std::mem::forget(child);
     Ok(())
 }
 
@@ -311,13 +384,34 @@ fn stop_native_watch(app: &tauri::AppHandle) -> Result<(), String> {
     let runtime = app.state::<Mutex<RuntimeState>>();
     let mut state = runtime.lock().map_err(|error| error.to_string())?;
     stop_native_watch_locked(&mut state);
+    drop(state);
+    kill_orphaned_ai_reminder_watchers();
     Ok(())
 }
 
-fn destroy_main_window(app: &tauri::AppHandle) -> Result<(), String> {
-    if let Some(win) = app.get_webview_window("main") {
-        win.destroy().map_err(|error| error.to_string())?;
+fn set_allow_window_destroy(app: &tauri::AppHandle, allow: bool) {
+    if let Ok(mut state) = app.state::<Mutex<RuntimeState>>().lock() {
+        state.allow_window_destroy = allow;
     }
+}
+
+fn destroy_main_window(app: &tauri::AppHandle) -> Result<(), String> {
+    // Allow CloseRequested to proceed; otherwise destroy/close is cancelled.
+    set_allow_window_destroy(app, true);
+
+    if let Some(win) = app.get_webview_window("main") {
+        // Prefer destroy; if the platform maps it through CloseRequested, the
+        // flag above prevents prevent_close(). Fall back to close().
+        if let Err(destroy_error) = win.destroy() {
+            if let Err(close_error) = win.close() {
+                set_allow_window_destroy(app, false);
+                return Err(format!(
+                    "destroy failed: {destroy_error}; close failed: {close_error}"
+                ));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -341,21 +435,51 @@ fn ensure_main_window(app: &tauri::AppHandle) -> Result<(), String> {
 }
 
 fn enter_lightweight_mode_impl(app: &tauri::AppHandle) -> Result<(), String> {
+    // Already tray-only: just ensure watch + tray menu.
+    let already = app
+        .state::<Mutex<RuntimeState>>()
+        .lock()
+        .map(|state| state.lightweight && app.get_webview_window("main").is_none())
+        .unwrap_or(false);
+    if already {
+        let _ = start_native_watch(app);
+        let _ = refresh_tray_menu(app);
+        return Ok(());
+    }
+
     if let Some(tray) = app.tray_by_id("main") {
         tray.set_visible(true).map_err(|error| error.to_string())?;
     }
 
+    // Frontend may still own an ai-reminder watch via shell plugin. Kill it
+    // before starting the Rust-owned one so we don't run two watchers, and so
+    // lightweight mode does not depend on the webview JS path.
+    kill_orphaned_ai_reminder_watchers();
+
     // Keep completion monitoring alive after the webview is destroyed.
-    start_native_watch(app)?;
+    // If watch start fails, still destroy the UI — tray stays for recovery.
+    let watch_error = start_native_watch(app).err();
     destroy_main_window(app)?;
 
     {
         let runtime = app.state::<Mutex<RuntimeState>>();
         let mut state = runtime.lock().map_err(|error| error.to_string())?;
         state.lightweight = true;
+        state.allow_window_destroy = false;
     }
 
     refresh_tray_menu(app)?;
+
+    if let Some(error) = watch_error {
+        // Surface via tooltip so the user can tell watch failed.
+        if let Some(tray) = app.tray_by_id("main") {
+            let _ = tray.set_tooltip(Some(format!(
+                "AI CLI Complete Notify（轻量模式，监听启动失败: {error}）"
+            )));
+        }
+        return Err(error);
+    }
+
     Ok(())
 }
 
@@ -368,6 +492,7 @@ fn exit_lightweight_mode_impl(app: &tauri::AppHandle) -> Result<(), String> {
         let runtime = app.state::<Mutex<RuntimeState>>();
         let mut state = runtime.lock().map_err(|error| error.to_string())?;
         state.lightweight = false;
+        state.allow_window_destroy = false;
     }
 
     refresh_tray_menu(app)?;
@@ -375,10 +500,12 @@ fn exit_lightweight_mode_impl(app: &tauri::AppHandle) -> Result<(), String> {
 }
 
 fn request_enter_lightweight_mode(app: &tauri::AppHandle) {
+    // Always enter from Rust. Depending only on the frontend event is fragile:
+    // if JS fails after stopping its watch, the UI stays up and monitoring dies.
+    // Optionally notify the frontend so it can stop its shell child first; we
+    // also kill orphaned watchers inside enter_lightweight_mode_impl.
     if let Some(win) = app.get_webview_window("main") {
-        // Ask the frontend to stop its shell-owned watch first, then confirm.
         let _ = win.emit("enter-lightweight-requested", ());
-        return;
     }
 
     let _ = enter_lightweight_mode_impl(app);
@@ -505,6 +632,20 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let allow_destroy = window
+                    .app_handle()
+                    .state::<Mutex<RuntimeState>>()
+                    .lock()
+                    .map(|state| state.allow_window_destroy || state.lightweight)
+                    .unwrap_or(false);
+
+                // Lightweight mode uses destroy()/close() to tear down the
+                // webview. Those paths also raise CloseRequested; if we always
+                // prevent_close, the tray "轻量模式" action appears to do nothing.
+                if allow_destroy {
+                    return;
+                }
+
                 api.prevent_close();
 
                 match read_close_behavior() {

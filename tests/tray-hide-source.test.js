@@ -36,9 +36,13 @@ test('tray lightweight mode destroys webview and keeps native watch', () => {
   assert.match(rustSource, /start_native_watch/);
   assert.match(rustSource, /enter-lightweight-requested/);
   assert.match(rustSource, /WebviewWindowBuilder::new/);
+  assert.match(rustSource, /allow_window_destroy/);
+  assert.match(rustSource, /if allow_destroy \{\s*return;/);
+  assert.match(rustSource, /fn request_enter_lightweight_mode/);
+  assert.match(rustSource, /enter_lightweight_mode_impl\(app\)/);
 
   assert.match(appSource, /enter-lightweight-requested/);
-  assert.match(appSource, /enterLightweightMode\(\)/);
+  // Boot path may still call enterLightweightMode as a safety net.
   assert.match(windowSource, /enter_lightweight_mode/);
   assert.match(windowSource, /stop_native_watch_command/);
   assert.match(watchSource, /stopNativeWatch\(\)/);
