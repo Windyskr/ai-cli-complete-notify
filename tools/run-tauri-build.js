@@ -1,4 +1,5 @@
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
@@ -10,6 +11,24 @@ function prependPath(env, value) {
 
 function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
+}
+
+function ensureWritableDir(candidates) {
+  const errors = [];
+  for (const dirPath of candidates) {
+    if (!dirPath) continue;
+    try {
+      ensureDir(dirPath);
+      // Prefer a path we can actually write to (GitHub Actions may not have D:).
+      const probe = path.join(dirPath, `.write-probe-${process.pid}`);
+      fs.writeFileSync(probe, 'ok');
+      fs.unlinkSync(probe);
+      return dirPath;
+    } catch (error) {
+      errors.push(`${dirPath}: ${error && error.message ? error.message : error}`);
+    }
+  }
+  throw new Error(`No writable temp/cache directory. Tried: ${errors.join(' | ')}`);
 }
 
 function resolveWindowsRustEnv(rootDir) {
@@ -48,13 +67,21 @@ function resolveWindowsRustEnv(rootDir) {
   prependPath(env, path.dirname(process.execPath));
   prependPath(env, path.join(cargoHome, 'bin'));
 
-  const tempDir = env.AI_NOTIFY_TMP_DIR || 'D:\\tmp';
-  ensureDir(tempDir);
+  const tempDir = ensureWritableDir([
+    env.AI_NOTIFY_TMP_DIR,
+    process.env.RUNNER_TEMP && path.join(process.env.RUNNER_TEMP, 'ai-cli-complete-notify'),
+    'D:\\tmp',
+    path.join(os.tmpdir(), 'ai-cli-complete-notify'),
+  ]);
   env.TEMP = tempDir;
   env.TMP = tempDir;
 
-  const npmCacheDir = env.npm_config_cache || 'D:\\npm-cache';
-  ensureDir(npmCacheDir);
+  const npmCacheDir = ensureWritableDir([
+    env.npm_config_cache,
+    process.env.RUNNER_TEMP && path.join(process.env.RUNNER_TEMP, 'npm-cache'),
+    'D:\\npm-cache',
+    path.join(os.tmpdir(), 'ai-cli-complete-notify-npm-cache'),
+  ]);
   env.npm_config_cache = npmCacheDir;
 
   return env;
