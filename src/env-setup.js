@@ -104,9 +104,11 @@ function getTemplateContent() {
   return formatTemplateForRuntime(FALLBACK_ENV_EXAMPLE);
 }
 
-function getRecommendedEnvPath(explicitPath, envCandidates) {
+function getRecommendedEnvPath(explicitPath) {
+  // Recommended write path must match the first candidate core would load when
+  // no legacy file exists. Packaged + dataDir keeps settings.json and .env together.
   if (explicitPath) return explicitPath;
-  if (isPackagedRuntime()) return envCandidates[0] || getPrimaryEnvPath();
+  if (isPackagedRuntime()) return getPrimaryEnvPath();
   return path.join(process.cwd(), '.env');
 }
 
@@ -114,15 +116,20 @@ function getEnvSetupStatus(options = {}) {
   const createExample = Boolean(options.createExample);
   const explicit = pickFirstEnv(ENV_PATH_ENV);
   const explicitPath = explicit ? path.resolve(explicit) : '';
+  // Same search order as bootstrapEnv(): explicit override → shared candidates.
   const envCandidates = uniquePaths([
     explicitPath,
     ...getEnvPathCandidates(),
     path.join(__dirname, '..', '.env')
   ]);
-  const recommendedEnvPath = getRecommendedEnvPath(explicitPath, envCandidates);
-  const examplePath = path.join(path.dirname(recommendedEnvPath), '.env.example');
+  const recommendedEnvPath = getRecommendedEnvPath(explicitPath);
+  // What core actually loaded (first existing file in bootstrap order).
   const loadedEnvPath = envCandidates.find((candidate) => exists(candidate)) || '';
   const envExists = Boolean(loadedEnvPath);
+  // UI should open the folder that matches the truth: loaded file if any, else
+  // the recommended write location next to settings.
+  const displayEnvPath = loadedEnvPath || recommendedEnvPath;
+  const examplePath = path.join(path.dirname(recommendedEnvPath), '.env.example');
   let exampleCreated = false;
   let exampleExists = exists(examplePath);
   let error = '';
@@ -142,8 +149,14 @@ function getEnvSetupStatus(options = {}) {
     ok: !error,
     status: envExists ? 'loaded' : 'missing',
     dataDir: getDataDir(),
-    envPath: recommendedEnvPath,
+    // Canonical fields for UI:
+    // - envPath: path to show / recommend (loaded if present, else write target)
+    // - loadedEnvPath: actual file core loaded (empty when missing)
+    // - recommendedEnvPath: where user should create .env when missing
+    envPath: displayEnvPath,
     loadedEnvPath,
+    recommendedEnvPath,
+    envCandidates,
     envExists,
     examplePath,
     exampleExists,

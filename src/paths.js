@@ -100,20 +100,20 @@ function getEnvPathCandidates() {
   const executableEnvPath = getExecutableEnvPath();
   const cwdEnvPath = path.join(process.cwd(), '.env');
 
-  if (process.platform === 'darwin' && isPackagedRuntime()) {
+  // Packaged apps (Windows portable / macOS .app) keep settings.json and .env
+  // under the same dataDir so UI "open data folder" matches what core loads.
+  // Still accept a legacy .env next to the executable / cwd as fallback.
+  if (isPackagedRuntime()) {
     candidates.push(dataEnvPath);
-    candidates.push(cwdEnvPath);
     if (executableEnvPath) candidates.push(executableEnvPath);
+    candidates.push(cwdEnvPath);
     return [...new Set(candidates)];
   }
 
-  if (executableEnvPath) candidates.push(executableEnvPath);
-
-  // 然后尝试当前工作目录（便于 dev）
+  // Dev / source: prefer cwd for local .env, then dataDir, then next-to-script.
   candidates.push(cwdEnvPath);
-
-  // 最后尝试数据目录
   candidates.push(dataEnvPath);
+  if (executableEnvPath) candidates.push(executableEnvPath);
 
   return [...new Set(candidates)];
 }

@@ -127,8 +127,37 @@ test('env setup creates .env.example next to the source cwd in dev mode', () => 
 
     assert.equal(status.status, 'missing');
     assert.equal(status.envPath, path.join(cwd, '.env'));
+    assert.equal(status.recommendedEnvPath, path.join(cwd, '.env'));
     assert.equal(status.examplePath, path.join(cwd, '.env.example'));
     assert.equal(status.exampleCreated, true);
     assert.equal(fs.existsSync(path.join(tempDir, '.env.example')), true);
+  });
+});
+
+test('packaged runtime recommends dataDir .env and reports loaded path from core order', () => {
+  withTempHome((tempHome) => {
+    process.env.AI_CLI_COMPLETE_NOTIFY_PACKAGED = '1';
+    process.env.AI_CLI_COMPLETE_NOTIFY_DATA_DIR = path.join(tempHome, 'data');
+    // Simulate portable layout: legacy .env next to a fake execPath is not needed;
+    // dataDir is the canonical write/load location.
+    const dataDir = process.env.AI_CLI_COMPLETE_NOTIFY_DATA_DIR;
+    const envPath = path.join(dataDir, '.env');
+    fs.mkdirSync(dataDir, { recursive: true });
+
+    const missing = getEnvSetupStatus({ createExample: true });
+    assert.equal(missing.status, 'missing');
+    assert.equal(missing.dataDir, dataDir);
+    assert.equal(missing.recommendedEnvPath, envPath);
+    assert.equal(missing.envPath, envPath);
+    assert.equal(missing.loadedEnvPath, '');
+    assert.equal(missing.examplePath, path.join(dataDir, '.env.example'));
+    assert.equal(missing.exampleCreated, true);
+
+    fs.writeFileSync(envPath, 'WEBHOOK_URLS=https://example.test/hook\n', 'utf8');
+    const loaded = getEnvSetupStatus({ createExample: false });
+    assert.equal(loaded.status, 'loaded');
+    assert.equal(loaded.loadedEnvPath, envPath);
+    assert.equal(loaded.envPath, envPath);
+    assert.equal(loaded.recommendedEnvPath, envPath);
   });
 });

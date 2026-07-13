@@ -115,8 +115,13 @@ export interface EnvSetupStatus {
   ok: boolean;
   status: 'loaded' | 'missing';
   dataDir: string;
+  /** Path shown in UI: loaded file if present, else recommended write path. */
   envPath: string;
+  /** Actual .env file core loaded (empty when none). */
   loadedEnvPath: string;
+  /** Where the user should create .env when missing (dataDir for packaged apps). */
+  recommendedEnvPath?: string;
+  envCandidates?: string[];
   envExists: boolean;
   examplePath: string;
   exampleExists: boolean;

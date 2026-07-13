@@ -239,8 +239,20 @@ export default function App() {
   }, []);
 
   const handleOpenEnvFolder = useCallback(() => {
-    if (!envStatus?.dataDir) return;
-    sidecar(['open-file', envStatus.dataDir]).catch((e) => console.error('open env folder failed:', e));
+    // Open the folder that matches core truth: loaded .env, recommended write
+    // path, or dataDir (settings.json lives here for packaged apps).
+    const target =
+      envStatus?.loadedEnvPath
+      || envStatus?.recommendedEnvPath
+      || envStatus?.envPath
+      || envStatus?.dataDir
+      || '';
+    if (!target) return;
+    // open-file accepts a file or directory path.
+    const folder = target.endsWith('.env') || target.endsWith('.env.example')
+      ? target.replace(/[\\/][^\\/]+$/, '') || target
+      : target;
+    sidecar(['open-file', folder || envStatus?.dataDir || target]).catch((e) => console.error('open env folder failed:', e));
   }, [envStatus]);
 
   const handleRecheckEnv = useCallback(async () => {
@@ -338,16 +350,20 @@ export default function App() {
                     : `检查 .env 失败：${envStatus.error}`)
                 : envStatus.status === 'loaded'
                   ? ((config.ui.language || 'zh-CN').toLowerCase().startsWith('en')
-                      ? `.env loaded successfully: ${envStatus.loadedEnvPath || envStatus.envPath}`
-                      : `.env 配置加载成功：${envStatus.loadedEnvPath || envStatus.envPath}`)
+                      ? `.env loaded by core: ${envStatus.loadedEnvPath || envStatus.envPath}`
+                      : `core 已加载 .env：${envStatus.loadedEnvPath || envStatus.envPath}`)
                   : ((config.ui.language || 'zh-CN').toLowerCase().startsWith('en')
-                      ? `No .env found. Created ${envStatus.examplePath}; copy it to ${envStatus.envPath} and fill in your notification settings. On macOS, if Finder does not show .env.example, press Command+Shift+. to show hidden files.`
-                      : `未找到 .env，已创建 ${envStatus.examplePath}。请复制为 ${envStatus.envPath} 后填写通知配置。macOS 上如果 Finder 看不见 .env.example，请按 Command+Shift+. 显示隐藏文件。`)}
+                      ? `No .env loaded. Settings live in ${envStatus.dataDir}. Put .env at ${envStatus.recommendedEnvPath || envStatus.envPath}${envStatus.examplePath ? ` (template: ${envStatus.examplePath})` : ''}.`
+                      : `core 未加载 .env。设置目录：${envStatus.dataDir}。请将 .env 放到：${envStatus.recommendedEnvPath || envStatus.envPath}${envStatus.examplePath ? `（模板：${envStatus.examplePath}）` : ''}。`)}
             </span>
-            {envStatus.status !== 'loaded' && envStatus.dataDir && (
+            {(envStatus.dataDir || envStatus.envPath || envStatus.recommendedEnvPath) && (
               <button
                 onClick={handleOpenEnvFolder}
-                className="shrink-0 rounded-lg border border-yellow-400/30 px-2.5 py-1 text-xs text-yellow-100/90 hover:border-yellow-300/60 hover:text-yellow-50 transition-colors"
+                className={`shrink-0 rounded-lg border px-2.5 py-1 text-xs transition-colors ${
+                  envStatus.status === 'loaded'
+                    ? 'border-emerald-300/30 text-emerald-100/90 hover:border-emerald-200/60 hover:text-emerald-50'
+                    : 'border-yellow-400/30 text-yellow-100/90 hover:border-yellow-300/60 hover:text-yellow-50'
+                }`}
               >
                 {(config.ui.language || 'zh-CN').toLowerCase().startsWith('en') ? 'Open folder' : '打开目录'}
               </button>
