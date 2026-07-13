@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef } from 'react';
 import { sidecar, spawnSidecar } from '@/lib/sidecar';
 import { dispatchNativeNotificationLine } from '@/lib/native-notification';
+import { stopNativeWatch } from '@/lib/window';
 import type { Child } from '@tauri-apps/plugin-shell';
 
 export function useWatch() {
@@ -44,6 +45,9 @@ export function useWatch() {
         '--claude-quiet-ms', String(opts.claudeQuietMs ?? 60000),
       ];
       try {
+        // Lightweight mode may leave a Rust-owned watch running; stop it first
+        // so we do not end up with two watchers after the UI is restored.
+        await stopNativeWatch().catch(() => undefined);
         stdoutBufferRef.current = '';
         const child = await spawnSidecar(
           args,

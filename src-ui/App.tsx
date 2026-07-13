@@ -8,7 +8,7 @@ import { useWatch } from '@/hooks/useWatch';
 import { useHooks } from '@/hooks/useHooks';
 import { getStartupStatus, setAutostartEnabled, type StartupStatus } from '@/lib/startup';
 import { sidecar } from '@/lib/sidecar';
-import { hideToTray } from '@/lib/window';
+import { enterLightweightMode, hideToTray } from '@/lib/window';
 import type { EnvSetupStatus } from '@/lib/types';
 import Sidebar from '@/components/Sidebar';
 import ChannelsPanel from '@/components/ChannelsPanel';
@@ -185,6 +185,29 @@ export default function App() {
       void unlistenPromise.then((unlisten) => unlisten());
     };
   }, []);
+
+  // Tray "Lightweight Mode": stop UI-owned watch, then destroy the webview.
+  useEffect(() => {
+    let cancelled = false;
+    const unlistenPromise = listen('enter-lightweight-requested', () => {
+      if (cancelled) return;
+      void (async () => {
+        try {
+          if (watch.running) {
+            await watch.stop();
+          }
+          await enterLightweightMode();
+        } catch (e) {
+          console.error('enter lightweight mode failed:', e);
+        }
+      })();
+    });
+
+    return () => {
+      cancelled = true;
+      void unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, [watch]);
 
   // Auto-start watch on first successful config load.
   useEffect(() => {
