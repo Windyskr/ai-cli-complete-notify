@@ -8,7 +8,7 @@ import { useWatch } from '@/hooks/useWatch';
 import { useHooks } from '@/hooks/useHooks';
 import { getStartupStatus, setAutostartEnabled, type StartupStatus } from '@/lib/startup';
 import { sidecar } from '@/lib/sidecar';
-import { enterLightweightMode, hideToTray } from '@/lib/window';
+import { hideToTray } from '@/lib/window';
 import type { EnvSetupStatus } from '@/lib/types';
 import Sidebar from '@/components/Sidebar';
 import ChannelsPanel from '@/components/ChannelsPanel';
@@ -155,14 +155,12 @@ export default function App() {
         }
       }
 
-      // lightweightStart is handled natively at boot (destroys webview).
-      // Keep a frontend safety path if the window still exists.
-      if (cfg?.ui?.lightweightStart) {
-        try {
-          await enterLightweightMode();
-        } catch (e) {
-          console.error('boot lightweight mode failed:', e);
-        }
+      // lightweightStart is handled entirely in Rust at process boot. Do NOT re-enter
+      // from the frontend when the setting is true — after tray restore the UI is
+      // recreated with the same settings.json, and re-entering would immediately
+      // destroy the just-restored window.
+      if (runtimeStartupStatus?.lightweightMode) {
+        // Tray-only: leave window/watch ownership to Rust.
         return;
       }
 
@@ -222,17 +220,19 @@ export default function App() {
   }, [watch]);
 
   // Auto-start watch on first successful config load.
+  // In tray-only lightweight mode Rust owns the watcher — do not spawn a second one.
+  // After restore, useWatch.start() stops any leftover native watch first.
   useEffect(() => {
-    if (config && !watch.running && !didAutoStartWatchRef.current) {
-      didAutoStartWatchRef.current = true;
-      watch.start({
-        sources: watchSources,
-        intervalMs: 1000,
-        geminiQuietMs: 3000,
-        claudeQuietMs: 60000,
-      });
-    }
-  }, [config, watch.running, watchSources]);  // eslint-disable-line react-hooks/exhaustive-deps
+    if (!config || watch.running || didAutoStartWatchRef.current) return;
+    if (startupStatus?.lightweightMode) return;
+    didAutoStartWatchRef.current = true;
+    watch.start({
+      sources: watchSources,
+      intervalMs: 1000,
+      geminiQuietMs: 3000,
+      claudeQuietMs: 60000,
+    });
+  }, [config, watch.running, watchSources, startupStatus?.lightweightMode]);  // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleDismissHooksBanner = useCallback(() => {
     setShowHooksBanner(false);

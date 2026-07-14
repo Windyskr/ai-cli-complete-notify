@@ -148,8 +148,7 @@ fn classify_exit_request(code: Option<i32>) -> ExitRequestAction {
 }
 
 fn restore_main_window(app: &tauri::AppHandle) {
-    #[cfg(target_os = "macos")]
-    let _ = app.show();
+    apply_tray_policy(app, true);
 
     if let Some(win) = app.get_webview_window("main") {
         #[cfg(target_os = "windows")]
@@ -174,6 +173,9 @@ fn hide_main_window_to_tray(app: &tauri::AppHandle) -> Result<(), String> {
         }
         win.hide().map_err(|error| error.to_string())?;
     }
+
+    // Close-to-tray should also drop the Dock icon (cc-switch style).
+    apply_tray_policy(app, false);
 
     Ok(())
 }
@@ -364,15 +366,54 @@ fn kill_orphaned_ai_reminder_watchers() {
             .status()
             .ok();
     }
+
+    // macOS/Linux: the packaged sidecar is a shell wrapper that execs
+    // `node .../ai-reminder.js watch ...`. BSD pkill uses basic regex and does
+    // not understand `\s`, so match the concrete argv fragments instead.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        for pattern in [
+            "ai-reminder.js watch",
+            "ai-reminder watch",
+            "ai-reminder-.* watch",
+        ] {
+            let mut cmd = StdCommand::new("pkill");
+            hide_console(&mut cmd)
+                .args(["-f", pattern])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .ok();
+        }
+    }
 }
 
+/// macOS: hide/show Dock + switch ActivationPolicy (same idea as cc-switch).
+/// Accessory keeps a tray-only process out of the Dock after webview destroy.
+#[cfg(target_os = "macos")]
+fn apply_tray_policy(app: &tauri::AppHandle, dock_visible: bool) {
+    use tauri::ActivationPolicy;
+
+    let desired = if dock_visible {
+        ActivationPolicy::Regular
+    } else {
+        ActivationPolicy::Accessory
+    };
+
+    let _ = app.set_dock_visibility(dock_visible);
+    let _ = app.set_activation_policy(desired);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn apply_tray_policy(_app: &tauri::AppHandle, _dock_visible: bool) {}
+
 fn start_native_watch(app: &tauri::AppHandle) -> Result<(), String> {
-    {
-        let runtime = app.state::<Mutex<RuntimeState>>();
-        let state = runtime.lock().map_err(|error| error.to_string())?;
-        if state.native_watch.is_some() || state.fallback_watch_running {
-            return Ok(());
-        }
+    // Hold the runtime lock across the "already running?" check and the spawn
+    // bookkeeping so concurrent enter/prepare paths cannot start two watches.
+    let runtime = app.state::<Mutex<RuntimeState>>();
+    let state = runtime.lock().map_err(|error| error.to_string())?;
+    if state.native_watch.is_some() || state.fallback_watch_running {
+        return Ok(());
     }
 
     let watch_args = [
@@ -388,6 +429,8 @@ fn start_native_watch(app: &tauri::AppHandle) -> Result<(), String> {
     ];
 
     // Preferred: Tauri sidecar (same path the UI uses).
+    // Drop the lock only for the blocking spawn itself, then re-check ownership.
+    drop(state);
     let sidecar_result = app
         .shell()
         .sidecar("binaries/ai-reminder")
@@ -399,8 +442,12 @@ fn start_native_watch(app: &tauri::AppHandle) -> Result<(), String> {
         });
 
     if let Ok((mut rx, child)) = sidecar_result {
-        let runtime = app.state::<Mutex<RuntimeState>>();
         let mut state = runtime.lock().map_err(|error| error.to_string())?;
+        if state.native_watch.is_some() || state.fallback_watch_running {
+            // Another path won the race — keep the existing watch.
+            let _ = child.kill();
+            return Ok(());
+        }
         state.native_watch = Some(child);
         drop(state);
 
@@ -437,7 +484,7 @@ fn start_native_watch(app: &tauri::AppHandle) -> Result<(), String> {
         })?;
 
     let mut cmd = StdCommand::new(&sidecar_path);
-    let child = hide_console(&mut cmd)
+    let mut child = hide_console(&mut cmd)
         .args(watch_args)
         .current_dir(dir)
         .stdin(std::process::Stdio::null())
@@ -452,13 +499,14 @@ fn start_native_watch(app: &tauri::AppHandle) -> Result<(), String> {
             )
         })?;
 
+    let mut state = runtime.lock().map_err(|error| error.to_string())?;
+    if state.native_watch.is_some() || state.fallback_watch_running {
+        let _ = child.kill();
+        return Ok(());
+    }
     // Track via flag; cleanup uses kill_orphaned_ai_reminder_watchers().
     std::mem::forget(child);
-    {
-        let runtime = app.state::<Mutex<RuntimeState>>();
-        let mut state = runtime.lock().map_err(|error| error.to_string())?;
-        state.fallback_watch_running = true;
-    }
+    state.fallback_watch_running = true;
     Ok(())
 }
 
@@ -493,6 +541,18 @@ fn request_app_exit(app: &tauri::AppHandle) {
 
 /// Prepare watch ownership for lightweight mode (kill UI watch, start native).
 fn prepare_lightweight_watch(app: &tauri::AppHandle) -> Result<(), String> {
+    // If Rust already owns a healthy watch, leave it alone. Re-entering
+    // lightweight mode (boot safety path / tray toggle race) must not kill and
+    // respawn, or macOS ends up with multiple orphaned watchers.
+    let already_running = app
+        .state::<Mutex<RuntimeState>>()
+        .lock()
+        .map(|state| state.native_watch.is_some() || state.fallback_watch_running)
+        .unwrap_or(false);
+    if already_running {
+        return Ok(());
+    }
+
     kill_orphaned_ai_reminder_watchers();
     start_native_watch(app)
 }
@@ -500,7 +560,10 @@ fn prepare_lightweight_watch(app: &tauri::AppHandle) -> Result<(), String> {
 fn handle_tray_menu_event(app: &tauri::AppHandle, event_id: &str) {
     match event_id {
         "show_main" => {
-            let _ = lightweight::exit_lightweight_mode(app);
+            if let Err(error) = lightweight::exit_lightweight_mode(app) {
+                eprintln!("[lightweight] tray show_main failed: {error}");
+            }
+            restore_main_window(app);
         }
         "lightweight_mode" => {
             // CheckMenuItem toggle: enter or exit based on current flag.
@@ -562,7 +625,11 @@ fn stop_native_watch_command(app: tauri::AppHandle) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            let _ = lightweight::exit_lightweight_mode(app);
+            if let Err(error) = lightweight::exit_lightweight_mode(app) {
+                eprintln!("[lightweight] single-instance restore failed: {error}");
+            }
+            // Even if we were only hidden (not destroyed), force show.
+            restore_main_window(app);
         }))
         .plugin(
             tauri_plugin_autostart::Builder::new()
@@ -641,7 +708,10 @@ pub fn run() {
                     } = event
                     {
                         let app = tray.app_handle();
-                        let _ = lightweight::exit_lightweight_mode(&app);
+                        if let Err(error) = lightweight::exit_lightweight_mode(app) {
+                            eprintln!("[lightweight] tray click restore failed: {error}");
+                        }
+                        restore_main_window(app);
                     }
                 })
                 .build(app)?;
@@ -717,7 +787,10 @@ pub fn run() {
                     ..
                 } => {
                     if !has_visible_windows {
-                        let _ = lightweight::exit_lightweight_mode(app);
+                        if let Err(error) = lightweight::exit_lightweight_mode(app) {
+                            eprintln!("[lightweight] reopen restore failed: {error}");
+                        }
+                        restore_main_window(app);
                     }
                 }
                 _ => {}

@@ -70,6 +70,15 @@ test('tray lightweight mode follows cc-switch destroy + prevent_exit pattern', (
   assert.match(windowSource, /enter_lightweight_mode/);
   assert.match(windowSource, /stop_native_watch_command/);
   assert.match(watchSource, /stopNativeWatch\(\)/);
+
+  // macOS: Dock policy + BSD-friendly orphan watch cleanup.
+  assert.match(rustSource, /fn apply_tray_policy/);
+  assert.match(rustSource, /ActivationPolicy::Accessory/);
+  assert.match(rustSource, /ai-reminder\.js watch/);
+  assert.match(lightweightSource, /\.visible\(true\)/);
+
+  // lightweightStart must not re-enter from the frontend after restore.
+  assert.doesNotMatch(appSource, /if \(cfg\?\.ui\?\.lightweightStart\) \{\s*try \{\s*await enterLightweightMode/);
 });
 
 test('lightweightStart boots into tray-only mode without loading UI', () => {

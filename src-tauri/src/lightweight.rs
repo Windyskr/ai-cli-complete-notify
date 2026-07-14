@@ -23,8 +23,7 @@ pub fn set_allow_window_destroy(allow: bool) {
 }
 
 fn restore_existing_window(app: &AppHandle) {
-    #[cfg(target_os = "macos")]
-    let _ = app.show();
+    crate::apply_tray_policy(app, true);
 
     if let Some(win) = app.get_webview_window("main") {
         #[cfg(target_os = "windows")]
@@ -46,9 +45,13 @@ fn destroy_main_window(app: &AppHandle) -> Result<(), String> {
             let _ = win.set_skip_taskbar(true);
         }
 
+        // Hide Dock before destroy so tray-only mode does not leave a Dock icon.
+        crate::apply_tray_policy(app, false);
+
         if let Err(destroy_error) = win.destroy() {
             if let Err(close_error) = win.close() {
                 set_allow_window_destroy(false);
+                crate::apply_tray_policy(app, true);
                 return Err(format!(
                     "destroy failed: {destroy_error}; close failed: {close_error}"
                 ));
@@ -66,6 +69,11 @@ fn ensure_main_window(app: &AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
+    // macOS: leave Accessory / hidden-Dock mode BEFORE creating a window.
+    // Building a webview while ActivationPolicy::Accessory often fails to
+    // produce a visible UI, which makes single-instance / tray restore look broken.
+    crate::apply_tray_policy(app, true);
+
     let window_config = app
         .config()
         .app
@@ -75,8 +83,11 @@ fn ensure_main_window(app: &AppHandle) -> Result<(), String> {
         .cloned()
         .ok_or_else(|| "main window config not found in tauri.conf".to_string())?;
 
+    // tauri.conf keeps main visible:false for silent/lightweight boot; force
+    // visible when restoring from tray-only mode.
     WebviewWindowBuilder::from_config(app, &window_config)
         .map_err(|error| format!("load main window config failed: {error}"))?
+        .visible(true)
         .build()
         .map_err(|error| format!("create main window failed: {error}"))?;
 
@@ -91,8 +102,8 @@ where
     F: FnOnce(&AppHandle) -> Result<(), String>,
 {
     if is_lightweight_mode() && app.get_webview_window("main").is_none() {
-        // Already tray-only; still run prepare so watch stays healthy.
-        prepare(app)?;
+        // Already tray-only. prepare is idempotent when a native watch is owned.
+        let _ = prepare(app);
         crate::refresh_tray_menu(app)?;
         return Ok(());
     }

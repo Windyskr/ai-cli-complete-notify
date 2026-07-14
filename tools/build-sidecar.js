@@ -96,6 +96,9 @@ function formatMacEnvExample(content) {
 }
 
 function writeMacSidecarScript(output) {
+  // Prefer the fully self-contained Node we stage under resources/node.
+  // Fall back to PATH node so dev/homebrew machines still work if the
+  // staged binary is missing or was accidentally replaced by a linked build.
   const script = `#!/bin/sh
 set -eu
 
@@ -112,17 +115,35 @@ BIN_DIR="$(CDPATH= cd -- "$(dirname -- "$SELF")" && pwd)"
 
 # Packaged .app: binary is in Contents/MacOS, resources in Contents/Resources
 # Dev mode: binary and resources/ are siblings in the same target directory
+ENTRY=""
+for BASE in "$BIN_DIR/../Resources/resources" "$BIN_DIR/../Resources" "$BIN_DIR/resources"; do
+  CANDIDATE="$BASE/ai-reminder/ai-reminder.js"
+  if [ -f "$CANDIDATE" ]; then
+    ENTRY="$CANDIDATE"
+    break
+  fi
+done
+
+if [ -z "$ENTRY" ]; then
+  echo "Unable to locate bundled ai-reminder entry script." >&2
+  exit 127
+fi
+
+export AI_CLI_COMPLETE_NOTIFY_PACKAGED=1
+export AI_CLI_COMPLETE_NOTIFY_DESKTOP_STDOUT=1
+
 for BASE in "$BIN_DIR/../Resources/resources" "$BIN_DIR/../Resources" "$BIN_DIR/resources"; do
   NODE_BIN="$BASE/node/bin/node"
-  ENTRY="$BASE/ai-reminder/ai-reminder.js"
-  if [ -x "$NODE_BIN" ] && [ -f "$ENTRY" ]; then
-    export AI_CLI_COMPLETE_NOTIFY_PACKAGED=1
-    export AI_CLI_COMPLETE_NOTIFY_DESKTOP_STDOUT=1
+  if [ -x "$NODE_BIN" ]; then
     exec "$NODE_BIN" "$ENTRY" "$@"
   fi
 done
 
-echo "Unable to locate bundled ai-reminder runtime." >&2
+if command -v node >/dev/null 2>&1; then
+  exec node "$ENTRY" "$@"
+fi
+
+echo "Unable to locate a usable Node.js runtime for ai-reminder." >&2
 exit 127
 `;
 
@@ -130,14 +151,86 @@ exit 127
   fs.chmodSync(output, 0o755);
 }
 
-function buildMacSidecar(rootDir, output) {
+function resolveMacNodeArch(arch) {
+  if (arch === 'arm64') return 'arm64';
+  if (arch === 'x64') return 'x64';
+  throw new Error(`Unsupported macOS Node arch: ${arch}`);
+}
+
+function ensureStandaloneMacNode(rootDir, arch) {
+  // Official node.org tarballs ship a self-contained binary. Copying the
+  // Homebrew node binary alone fails at runtime (missing libnode + deps).
+  const version = String(
+    process.env.AI_NOTIFY_NODE_VERSION || process.env.npm_config_node_version || 'v22.17.0'
+  ).replace(/^v/, '');
+  const nodeVersion = `v${version}`;
+  const nodeArch = resolveMacNodeArch(arch);
+  const distName = `node-${nodeVersion}-darwin-${nodeArch}`;
+  const cacheDir = path.join(rootDir, 'tools', '.cache', 'node', distName);
+  const cachedNode = path.join(cacheDir, 'bin', 'node');
+
+  if (!fs.existsSync(cachedNode)) {
+    const url = `https://nodejs.org/dist/${nodeVersion}/${distName}.tar.gz`;
+    const tarPath = path.join(rootDir, 'tools', '.cache', 'node', `${distName}.tar.gz`);
+    fs.mkdirSync(path.dirname(tarPath), { recursive: true });
+
+    console.log(`[sidecar] downloading standalone Node ${nodeVersion} (${nodeArch})...`);
+    const curl = spawnSync(
+      'curl',
+      ['-fsSL', url, '-o', tarPath],
+      { stdio: 'inherit' }
+    );
+    if (curl.status !== 0) {
+      throw new Error(`Failed to download ${url}`);
+    }
+
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+    fs.mkdirSync(cacheDir, { recursive: true });
+    const extract = spawnSync(
+      'tar',
+      ['-xzf', tarPath, '-C', cacheDir, '--strip-components=1'],
+      { stdio: 'inherit' }
+    );
+    if (extract.status !== 0 || !fs.existsSync(cachedNode)) {
+      throw new Error(`Failed to extract standalone Node from ${tarPath}`);
+    }
+  }
+
+  // Sanity: refuse to stage a Homebrew-linked binary if someone drops one in cache.
+  const otool = spawnSync('otool', ['-L', cachedNode], { encoding: 'utf8' });
+  if (otool.status === 0 && /homebrew/i.test(otool.stdout || '')) {
+    throw new Error(
+      `Standalone Node at ${cachedNode} still links Homebrew libs; clear tools/.cache/node and retry`
+    );
+  }
+
+  return cacheDir;
+}
+
+function stageMacNodeRuntime(rootDir, resourcesDir, arch) {
+  const nodeResourceRoot = path.join(resourcesDir, 'node');
+  cleanDir(nodeResourceRoot);
+
+  const standaloneRoot = ensureStandaloneMacNode(rootDir, arch);
+  // Only stage what the wrapper needs: bin/node (+ any same-dir dylibs if present).
+  fs.mkdirSync(path.join(nodeResourceRoot, 'bin'), { recursive: true });
+  fs.copyFileSync(
+    path.join(standaloneRoot, 'bin', 'node'),
+    path.join(nodeResourceRoot, 'bin', 'node')
+  );
+  fs.chmodSync(path.join(nodeResourceRoot, 'bin', 'node'), 0o755);
+
+  const libDir = path.join(standaloneRoot, 'lib');
+  if (fs.existsSync(libDir)) {
+    copyDir(libDir, path.join(nodeResourceRoot, 'lib'));
+  }
+}
+
+function buildMacSidecar(rootDir, output, arch) {
   const resourcesDir = path.join(rootDir, 'src-tauri', 'resources');
   const appResourceDir = path.join(resourcesDir, 'ai-reminder');
-  const nodeResourceDir = path.join(resourcesDir, 'node', 'bin');
-  const nodePath = fs.realpathSync(process.execPath);
 
   cleanDir(appResourceDir);
-  cleanDir(nodeResourceDir);
 
   fs.copyFileSync(path.join(rootDir, 'ai-reminder.js'), path.join(appResourceDir, 'ai-reminder.js'));
   fs.copyFileSync(path.join(rootDir, 'package.json'), path.join(appResourceDir, 'package.json'));
@@ -151,9 +244,7 @@ function buildMacSidecar(rootDir, output) {
   copyRuntimeDependency(rootDir, resourcesDir, 'dotenv');
   copyRuntimeDependency(rootDir, resourcesDir, 'nodemailer');
 
-  fs.copyFileSync(nodePath, path.join(nodeResourceDir, 'node'));
-  fs.chmodSync(path.join(nodeResourceDir, 'node'), 0o755);
-
+  stageMacNodeRuntime(rootDir, resourcesDir, arch);
   writeMacSidecarScript(output);
 }
 
@@ -188,7 +279,7 @@ function main() {
 
   if (platform === 'darwin') {
     fs.mkdirSync(binariesDir, { recursive: true });
-    buildMacSidecar(rootDir, output);
+    buildMacSidecar(rootDir, output, arch);
     console.log(`[sidecar] ${platform}:${arch} -> ${path.relative(rootDir, output)}`);
     return;
   }
