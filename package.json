@@ -18,6 +18,7 @@
     "dist:mac": "npm run dist:mac:app",
     "dist:mac:app": "npm run build:sidecar:mac && node tools/run-tauri-build.js --bundles app",
     "dist:mac:dmg": "npm run build:sidecar:mac && node tools/run-tauri-build.js --bundles dmg",
+    "test": "node --test tests/**/*.test.js",
     "wizard": "node setup-wizard.js"
   },
   "keywords": [],

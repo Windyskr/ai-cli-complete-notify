@@ -4,15 +4,20 @@ on:
   workflow_dispatch:
   push:
     branches:
+      - main
       - feat/lightweight-mode
+    tags:
+      - "v*"
     paths:
       - ".github/workflows/build-windows-portable.yml"
       - "package.json"
       - "package-lock.json"
+      - "config.example.json"
       - "src/**"
       - "src-ui/**"
       - "src-tauri/**"
       - "tools/**"
+      - "tests/**"
       - "vite.config.ts"
       - "tsconfig.json"
       - "tailwind.config.js"
@@ -75,6 +80,13 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
+      - name: Run unit tests
+        run: npm test
+
+      - name: Run Rust unit tests
+        working-directory: src-tauri
+        run: cargo test
+
       - name: Build portable package
         run: npm run dist:portable
 
@@ -87,13 +99,15 @@ jobs:
           Get-ChildItem dist -Recurse -File |
             Select-Object FullName, Length, LastWriteTime |
             Format-Table -AutoSize
+          $zip = Get-ChildItem dist -Filter "ai-cli-complete-notify-*-portable-win-x64.zip" -File -ErrorAction SilentlyContinue
+          if (-not $zip) {
+            throw "portable zip not found in dist/"
+          }
 
       - name: Upload portable zip
         uses: actions/upload-artifact@v4
         with:
           name: ai-cli-complete-notify-${{ github.sha }}-portable-win-x64
-          path: |
-            dist/ai-cli-complete-notify-*-portable-win-x64.zip
-            dist/ai-cli-complete-notify-*-portable-win-x64/**
+          path: dist/ai-cli-complete-notify-*-portable-win-x64.zip
           if-no-files-found: error
           retention-days: 14

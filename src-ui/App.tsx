@@ -8,7 +8,7 @@ import { useWatch } from '@/hooks/useWatch';
 import { useHooks } from '@/hooks/useHooks';
 import { getStartupStatus, setAutostartEnabled, type StartupStatus } from '@/lib/startup';
 import { sidecar } from '@/lib/sidecar';
-import { hideToTray } from '@/lib/window';
+import { hideToTray, requestAppExit } from '@/lib/window';
 import type { EnvSetupStatus } from '@/lib/types';
 import Sidebar from '@/components/Sidebar';
 import ChannelsPanel from '@/components/ChannelsPanel';
@@ -93,6 +93,8 @@ export default function App() {
           autostartEnabled: actualEnabled,
           autostartSupported: prev?.autostartSupported ?? true,
           silentStartRequested: prev?.silentStartRequested ?? false,
+          lightweightMode: prev?.lightweightMode ?? false,
+          nativeWatchRunning: prev?.nativeWatchRunning ?? false,
           autostartError: null,
         }));
         await save(nextConfig);
@@ -102,6 +104,8 @@ export default function App() {
           autostartEnabled: prev?.autostartEnabled ?? config.ui.autostart,
           autostartSupported: prev?.autostartSupported ?? false,
           silentStartRequested: prev?.silentStartRequested ?? false,
+          lightweightMode: prev?.lightweightMode ?? false,
+          nativeWatchRunning: prev?.nativeWatchRunning ?? false,
           autostartError: message || 'Unknown error',
         }));
       } finally {
@@ -198,14 +202,18 @@ export default function App() {
   // Tray "Lightweight Mode": Rust owns the transition now (destroy webview +
   // native watch). Frontend only stops its shell-owned watch to avoid a brief
   // double watcher; do not block on enterLightweightMode here.
+  // Depend on stable callbacks only — useWatch returns a new object each render
+  // (logs update), and [watch] would re-subscribe on every stdout line.
+  const watchRunning = watch.running;
+  const watchStop = watch.stop;
   useEffect(() => {
     let cancelled = false;
     const unlistenPromise = listen('enter-lightweight-requested', () => {
       if (cancelled) return;
       void (async () => {
         try {
-          if (watch.running) {
-            await watch.stop();
+          if (watchRunning) {
+            await watchStop();
           }
         } catch (e) {
           console.error('stop watch before lightweight mode failed:', e);
@@ -217,7 +225,7 @@ export default function App() {
       cancelled = true;
       void unlistenPromise.then((unlisten) => unlisten());
     };
-  }, [watch]);
+  }, [watchRunning, watchStop]);
 
   // Auto-start watch on first successful config load.
   // In tray-only lightweight mode Rust owns the watcher — do not spawn a second one.
@@ -463,7 +471,19 @@ export default function App() {
             }
 
             if (action === 'exit') {
-              await exit(0);
+              try {
+                if (watch.running) {
+                  await watch.stop();
+                }
+              } catch (e) {
+                console.error('stop watch before exit failed:', e);
+              }
+              try {
+                await requestAppExit();
+              } catch (e) {
+                console.error('requestAppExit failed, falling back to process exit:', e);
+                await exit(0);
+              }
             }
           }}
         />

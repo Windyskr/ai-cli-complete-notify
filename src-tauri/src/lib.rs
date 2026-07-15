@@ -4,7 +4,7 @@ use serde::Serialize;
 use std::{
     env, fs,
     path::PathBuf,
-    process::Command as StdCommand,
+    process::{Child as StdChild, Command as StdCommand},
     sync::Mutex,
 };
 #[cfg(target_os = "windows")]
@@ -41,18 +41,28 @@ struct LaunchState {
 struct RuntimeState {
     /// When true, ExitRequested is allowed to finish (tray Quit / explicit exit).
     allow_app_exit: bool,
-    native_watch: Option<CommandChild>,
-    /// Fallback watch started via std::process (portable layout).
-    fallback_watch_running: bool,
+    /// Bumped on every stop so in-flight start paths discard their child.
+    watch_generation: u64,
+    /// Preferred Tauri shell sidecar watch, tagged with the generation at store time.
+    native_watch: Option<(u64, CommandChild)>,
+    /// Portable/fallback std::process watch (kept so we can kill by handle).
+    fallback_watch: Option<(u64, StdChild)>,
 }
 
 impl Default for RuntimeState {
     fn default() -> Self {
         Self {
             allow_app_exit: false,
+            watch_generation: 0,
             native_watch: None,
-            fallback_watch_running: false,
+            fallback_watch: None,
         }
+    }
+}
+
+impl RuntimeState {
+    fn has_owned_watch(&self) -> bool {
+        self.native_watch.is_some() || self.fallback_watch.is_some()
     }
 }
 
@@ -262,7 +272,7 @@ fn build_startup_status(app: &tauri::AppHandle, launch_state: LaunchState) -> St
     let runtime = app.state::<Mutex<RuntimeState>>();
     let native_watch_running = runtime
         .lock()
-        .map(|state| state.native_watch.is_some() || state.fallback_watch_running)
+        .map(|state| state.has_owned_watch())
         .unwrap_or(false);
 
     match app.autolaunch().is_enabled() {
@@ -338,19 +348,26 @@ pub(crate) fn refresh_tray_menu(app: &tauri::AppHandle) -> Result<(), String> {
 }
 
 fn stop_native_watch_locked(state: &mut RuntimeState) {
-    if let Some(child) = state.native_watch.take() {
+    // Invalidate any in-flight start_native_watch that already dropped the lock.
+    state.watch_generation = state.watch_generation.wrapping_add(1);
+
+    if let Some((_gen, child)) = state.native_watch.take() {
         let _ = child.kill();
     }
-    state.fallback_watch_running = false;
+    if let Some((_gen, mut child)) = state.fallback_watch.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
-/// Best-effort: stop any ai-reminder watch left by the frontend shell plugin
-/// before/while entering lightweight mode.
+/// Best-effort: stop shell-plugin watches this app does not hold a Child for.
+/// Prefer owned-handle kill; this is only for UI-spawned leftovers.
 fn kill_orphaned_ai_reminder_watchers() {
     #[cfg(target_os = "windows")]
     {
         // Must use CREATE_NO_WINDOW: plain cmd/wmic opens Windows Terminal on Win11
         // with a blank tab titled like the working directory path.
+        // Match ai-reminder*.exe (portable ai-reminder.exe and any triple-named residual).
         let mut cmd = StdCommand::new("powershell.exe");
         hide_console(&mut cmd)
             .args([
@@ -359,7 +376,7 @@ fn kill_orphaned_ai_reminder_watchers() {
                 "-WindowStyle",
                 "Hidden",
                 "-Command",
-                "Get-CimInstance Win32_Process -Filter \"Name = 'ai-reminder.exe'\" | Where-Object { $_.CommandLine -match '(\\s|^)watch(\\s|$)' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
+                "Get-CimInstance Win32_Process | Where-Object { $_.Name -like 'ai-reminder*.exe' -and $_.CommandLine -match '(\\s|^)watch(\\s|$)' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -369,14 +386,11 @@ fn kill_orphaned_ai_reminder_watchers() {
 
     // macOS/Linux: the packaged sidecar is a shell wrapper that execs
     // `node .../ai-reminder.js watch ...`. BSD pkill uses basic regex and does
-    // not understand `\s`, so match the concrete argv fragments instead.
+    // not understand `\s`, so match concrete argv fragments only (avoid broad
+    // `ai-reminder-.* watch` which can hit unrelated tools).
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        for pattern in [
-            "ai-reminder.js watch",
-            "ai-reminder watch",
-            "ai-reminder-.* watch",
-        ] {
+        for pattern in ["ai-reminder.js watch", "ai-reminder watch"] {
             let mut cmd = StdCommand::new("pkill");
             hide_console(&mut cmd)
                 .args(["-f", pattern])
@@ -408,13 +422,15 @@ fn apply_tray_policy(app: &tauri::AppHandle, dock_visible: bool) {
 fn apply_tray_policy(_app: &tauri::AppHandle, _dock_visible: bool) {}
 
 fn start_native_watch(app: &tauri::AppHandle) -> Result<(), String> {
-    // Hold the runtime lock across the "already running?" check and the spawn
-    // bookkeeping so concurrent enter/prepare paths cannot start two watches.
+    // Capture generation under the lock, spawn outside, then store only if the
+    // generation is unchanged (stop_native_watch bumps it and kills owned children).
     let runtime = app.state::<Mutex<RuntimeState>>();
     let state = runtime.lock().map_err(|error| error.to_string())?;
-    if state.native_watch.is_some() || state.fallback_watch_running {
+    if state.has_owned_watch() {
         return Ok(());
     }
+    let generation = state.watch_generation;
+    drop(state);
 
     let watch_args = [
         "watch",
@@ -429,8 +445,6 @@ fn start_native_watch(app: &tauri::AppHandle) -> Result<(), String> {
     ];
 
     // Preferred: Tauri sidecar (same path the UI uses).
-    // Drop the lock only for the blocking spawn itself, then re-check ownership.
-    drop(state);
     let sidecar_result = app
         .shell()
         .sidecar("binaries/ai-reminder")
@@ -443,14 +457,15 @@ fn start_native_watch(app: &tauri::AppHandle) -> Result<(), String> {
 
     if let Ok((mut rx, child)) = sidecar_result {
         let mut state = runtime.lock().map_err(|error| error.to_string())?;
-        if state.native_watch.is_some() || state.fallback_watch_running {
-            // Another path won the race — keep the existing watch.
+        if state.watch_generation != generation || state.has_owned_watch() {
+            // Stop won the race — discard this spawn.
             let _ = child.kill();
             return Ok(());
         }
-        state.native_watch = Some(child);
+        state.native_watch = Some((generation, child));
         drop(state);
 
+        let app_handle = app.clone();
         tauri::async_runtime::spawn(async move {
             while let Some(event) = rx.recv().await {
                 match event {
@@ -459,11 +474,19 @@ fn start_native_watch(app: &tauri::AppHandle) -> Result<(), String> {
                     _ => {}
                 }
             }
+            // Reflect process death so prepare/start can respawn a healthy watch.
+            if let Ok(mut state) = app_handle.state::<Mutex<RuntimeState>>().lock() {
+                if let Some((gen, _)) = state.native_watch.as_ref() {
+                    if *gen == generation {
+                        state.native_watch = None;
+                    }
+                }
+            }
         });
         return Ok(());
     }
 
-    // Fallback for portable layouts: spawn ai-reminder.exe next to the main exe.
+    // Fallback for portable layouts: spawn ai-reminder next to the main exe.
     let exe = env::current_exe().map_err(|error| error.to_string())?;
     let dir = exe
         .parent()
@@ -472,6 +495,10 @@ fn start_native_watch(app: &tauri::AppHandle) -> Result<(), String> {
         dir.join("ai-reminder.exe"),
         dir.join("ai-reminder-x86_64-pc-windows-msvc.exe"),
         dir.join("ai-reminder"),
+        dir.join("ai-reminder-x86_64-apple-darwin"),
+        dir.join("ai-reminder-aarch64-apple-darwin"),
+        dir.join("ai-reminder-x86_64-unknown-linux-gnu"),
+        dir.join("ai-reminder-aarch64-unknown-linux-gnu"),
     ];
     let sidecar_path = candidates
         .into_iter()
@@ -500,19 +527,22 @@ fn start_native_watch(app: &tauri::AppHandle) -> Result<(), String> {
         })?;
 
     let mut state = runtime.lock().map_err(|error| error.to_string())?;
-    if state.native_watch.is_some() || state.fallback_watch_running {
+    if state.watch_generation != generation || state.has_owned_watch() {
         let _ = child.kill();
+        let _ = child.wait();
         return Ok(());
     }
-    // Track via flag; cleanup uses kill_orphaned_ai_reminder_watchers().
-    std::mem::forget(child);
-    state.fallback_watch_running = true;
+    // Keep the Child so stop can kill by handle.
+    state.fallback_watch = Some((generation, child));
     Ok(())
 }
 
 fn stop_native_watch(app: &tauri::AppHandle) -> Result<(), String> {
     let runtime = app.state::<Mutex<RuntimeState>>();
     let mut state = runtime.lock().map_err(|error| error.to_string())?;
+    // Bump generation + kill owned handles under the lock first so a concurrent
+    // start cannot store a child that kill_orphaned would then murder while
+    // RuntimeState still claims ownership.
     stop_native_watch_locked(&mut state);
     drop(state);
     kill_orphaned_ai_reminder_watchers();
@@ -544,10 +574,11 @@ fn prepare_lightweight_watch(app: &tauri::AppHandle) -> Result<(), String> {
     // If Rust already owns a healthy watch, leave it alone. Re-entering
     // lightweight mode (boot safety path / tray toggle race) must not kill and
     // respawn, or macOS ends up with multiple orphaned watchers.
+    // Death of the child clears ownership (see start_native_watch reaper).
     let already_running = app
         .state::<Mutex<RuntimeState>>()
         .lock()
-        .map(|state| state.native_watch.is_some() || state.fallback_watch_running)
+        .map(|state| state.has_owned_watch())
         .unwrap_or(false);
     if already_running {
         return Ok(());
@@ -621,6 +652,11 @@ fn stop_native_watch_command(app: tauri::AppHandle) -> Result<(), String> {
     stop_native_watch(&app)
 }
 
+#[tauri::command]
+fn request_app_exit_command(app: tauri::AppHandle) {
+    request_app_exit(&app);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -647,7 +683,8 @@ pub fn run() {
             enter_lightweight_mode,
             exit_lightweight_mode,
             is_lightweight_mode,
-            stop_native_watch_command
+            stop_native_watch_command,
+            request_app_exit_command
         ])
         .setup(|app| {
             let launch_state = LaunchState {

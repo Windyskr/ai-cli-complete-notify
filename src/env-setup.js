@@ -75,8 +75,13 @@ function uniquePaths(paths) {
 }
 
 function isPackagedRuntime() {
+  // Keep in sync with paths.js — macOS .app layout must count as packaged so
+  // recommendedEnvPath / dataDir match what core loads.
   if (process.pkg) return true;
   if (String(process.env.AI_CLI_COMPLETE_NOTIFY_PACKAGED || '') === '1') return true;
+  if (process.platform === 'darwin' && String(process.execPath || '').includes('.app/Contents/Resources/')) {
+    return true;
+  }
   return false;
 }
 

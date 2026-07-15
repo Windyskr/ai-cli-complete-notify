@@ -3,6 +3,7 @@
 //! and recreate the window from tauri.conf on demand.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, WebviewWindowBuilder};
 
 static LIGHTWEIGHT_MODE: AtomicBool = AtomicBool::new(false);
@@ -10,16 +11,22 @@ static LIGHTWEIGHT_MODE: AtomicBool = AtomicBool::new(false);
 /// When true, CloseRequested must not call prevent_close so destroy()/close() can finish.
 static ALLOW_WINDOW_DESTROY: AtomicBool = AtomicBool::new(false);
 
+/// Serialize enter/exit so destroy cannot race a just-recreated window.
+static MODE_LOCK: Mutex<()> = Mutex::new(());
+
 pub fn is_lightweight_mode() -> bool {
     LIGHTWEIGHT_MODE.load(Ordering::Acquire)
 }
 
+/// Only the short-lived destroy window should skip prevent_close.
+/// Do not OR with LIGHTWEIGHT_MODE — that bypassed Ask/Tray/Exit while enter
+/// was mid-flight with the main window still visible.
 pub fn allow_window_destroy() -> bool {
-    ALLOW_WINDOW_DESTROY.load(Ordering::Acquire) || is_lightweight_mode()
+    ALLOW_WINDOW_DESTROY.load(Ordering::Acquire)
 }
 
 pub fn set_allow_window_destroy(allow: bool) {
-    ALLOW_WINDOW_DESTROY.store(allow, Ordering::Release);
+    ALLOW_WINDOW_DESTROY.store(allow, Ordering::Release)
 }
 
 fn restore_existing_window(app: &AppHandle) {
@@ -101,6 +108,10 @@ pub fn enter_lightweight_mode<F>(app: &AppHandle, prepare: F) -> Result<(), Stri
 where
     F: FnOnce(&AppHandle) -> Result<(), String>,
 {
+    let _guard = MODE_LOCK
+        .lock()
+        .map_err(|error| format!("lightweight mode lock poisoned: {error}"))?;
+
     if is_lightweight_mode() && app.get_webview_window("main").is_none() {
         // Already tray-only. prepare is idempotent when a native watch is owned.
         let _ = prepare(app);
@@ -116,13 +127,21 @@ where
     LIGHTWEIGHT_MODE.store(true, Ordering::Release);
 
     // Optional: tell the frontend to stop its shell-owned watch first.
+    // Handoff is best-effort; prepare also kills orphans and starts native watch.
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.emit("enter-lightweight-requested", ());
     }
 
     // Best-effort prepare (watch handover). Destroy UI even if prepare fails.
     let prepare_error = prepare(app).err();
-    destroy_main_window(app)?;
+    if let Err(destroy_error) = destroy_main_window(app) {
+        // Roll back mode so CloseRequested Ask/Tray/Exit works again and tray
+        // does not claim lightweight while the main window is still up.
+        LIGHTWEIGHT_MODE.store(false, Ordering::Release);
+        set_allow_window_destroy(false);
+        let _ = crate::refresh_tray_menu(app);
+        return Err(destroy_error);
+    }
     set_allow_window_destroy(false);
 
     if let Some(tray) = app.tray_by_id(crate::TRAY_ID) {
@@ -145,6 +164,10 @@ where
 /// Exit tray-only mode: recreate/show main window and clear the flag.
 /// Native watch is intentionally left running until the frontend reclaims it.
 pub fn exit_lightweight_mode(app: &AppHandle) -> Result<(), String> {
+    let _guard = MODE_LOCK
+        .lock()
+        .map_err(|error| format!("lightweight mode lock poisoned: {error}"))?;
+
     ensure_main_window(app)?;
     LIGHTWEIGHT_MODE.store(false, Ordering::Release);
     set_allow_window_destroy(false);
@@ -156,6 +179,7 @@ pub fn toggle_lightweight_mode<F>(app: &AppHandle, prepare_enter: F) -> Result<(
 where
     F: FnOnce(&AppHandle) -> Result<(), String>,
 {
+    // Check outside the enter/exit locks; each path takes MODE_LOCK itself.
     if is_lightweight_mode() {
         exit_lightweight_mode(app)
     } else {

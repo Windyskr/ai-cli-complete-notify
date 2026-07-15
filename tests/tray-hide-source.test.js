@@ -66,9 +66,13 @@ test('tray lightweight mode follows cc-switch destroy + prevent_exit pattern', (
 
   // Watch handover kept for this app's architecture.
   assert.match(rustSource, /start_native_watch/);
+  assert.match(rustSource, /watch_generation/);
+  assert.match(rustSource, /fallback_watch/);
+  assert.doesNotMatch(rustSource, /std::mem::forget/);
   assert.match(appSource, /enter-lightweight-requested/);
   assert.match(windowSource, /enter_lightweight_mode/);
   assert.match(windowSource, /stop_native_watch_command/);
+  assert.match(windowSource, /request_app_exit_command/);
   assert.match(watchSource, /stopNativeWatch\(\)/);
 
   // macOS: Dock policy + BSD-friendly orphan watch cleanup.
@@ -76,6 +80,21 @@ test('tray lightweight mode follows cc-switch destroy + prevent_exit pattern', (
   assert.match(rustSource, /ActivationPolicy::Accessory/);
   assert.match(rustSource, /ai-reminder\.js watch/);
   assert.match(lightweightSource, /\.visible\(true\)/);
+  assert.match(lightweightSource, /MODE_LOCK/);
+  assert.match(lightweightSource, /LIGHTWEIGHT_MODE\.store\(false/);
+
+  // CloseRequested destroy skip is only the short-lived ALLOW flag.
+  assert.match(lightweightSource, /fn allow_window_destroy/);
+  assert.doesNotMatch(
+    lightweightSource,
+    /ALLOW_WINDOW_DESTROY\.load\(Ordering::Acquire\) \|\| is_lightweight_mode\(\)/,
+  );
+
+  // UI quit shares Rust cleanup path.
+  assert.match(appSource, /requestAppExit/);
+
+  // Listener must not depend on the whole watch object (re-subscribe every log line).
+  assert.match(appSource, /\[watchRunning, watchStop\]/);
 
   // lightweightStart must not re-enter from the frontend after restore.
   assert.doesNotMatch(appSource, /if \(cfg\?\.ui\?\.lightweightStart\) \{\s*try \{\s*await enterLightweightMode/);

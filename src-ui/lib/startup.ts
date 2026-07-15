@@ -4,8 +4,8 @@ export interface StartupStatus {
   autostartEnabled: boolean;
   autostartSupported: boolean;
   silentStartRequested: boolean;
-  lightweightMode?: boolean;
-  nativeWatchRunning?: boolean;
+  lightweightMode: boolean;
+  nativeWatchRunning: boolean;
   autostartError: string | null;
 }
 

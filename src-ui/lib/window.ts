@@ -22,3 +22,8 @@ export function isLightweightMode() {
 export function stopNativeWatch() {
   return invoke<void>('stop_native_watch_command');
 }
+
+/** Unified quit path: stop native watch, clear tray, then exit. */
+export function requestAppExit() {
+  return invoke<void>('request_app_exit_command');
+}
