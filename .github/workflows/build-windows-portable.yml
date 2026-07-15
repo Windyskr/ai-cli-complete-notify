@@ -83,6 +83,22 @@ jobs:
       - name: Run unit tests
         run: npm test
 
+      # tauri-build requires externalBin to exist at compile time. The real
+      # sidecar is produced later by dist:portable; a zero-byte stub is enough
+      # for cargo test of pure unit tests (classify_exit_request, etc.).
+      - name: Stage stub sidecar for cargo test
+        shell: pwsh
+        run: |
+          $dir = "src-tauri/binaries"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $stub = Join-Path $dir "ai-reminder-x86_64-pc-windows-msvc.exe"
+          if (-not (Test-Path $stub)) {
+            New-Item -ItemType File -Path $stub -Force | Out-Null
+            Write-Host "Created stub $stub"
+          } else {
+            Write-Host "Sidecar already present: $stub"
+          }
+
       - name: Run Rust unit tests
         working-directory: src-tauri
         run: cargo test
